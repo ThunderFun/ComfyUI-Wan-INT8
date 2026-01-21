@@ -20,8 +20,10 @@ class UNetLoaderINTW8A8:
         return {
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
-                "weight_dtype": (["default", "fp8_e4m3fn", "fp16", "bf16"],),
-                "model_type": (["flux2","z-image","chroma", "wan", "ltx2"],),
+                "model_type": (["flux2", "wan2.1", "wan2.2"],),
+                "offload_to_cpu": (["enable", "disable"],),
+                "chunk_size": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 512}),
+                "auto_convert_to_int8": (["enable", "disable"],),
             }
         }
 
@@ -30,15 +32,34 @@ class UNetLoaderINTW8A8:
     CATEGORY = "loaders"
     DESCRIPTION = "Load INT8 tensorwise quantized models with fast torch._int_mm inference."
 
-    def load_unet(self, unet_name, weight_dtype, model_type):
+    def load_unet(self, unet_name, model_type, offload_to_cpu, chunk_size, auto_convert_to_int8):
+        import comfy.model_management
+        import gc
+        from comfy.sd import load_diffusion_model
+        
+        # === CRITICAL: Free memory BEFORE loading new model ===
+        # This prevents OOM when loading a second model (e.g., Wan 2.2 low after Wan 2.2 high)
+        comfy.model_management.unload_all_models()
+        gc.collect()
+        try:
+            comfy.model_management.soft_empty_cache()
+        except RuntimeError as e:
+            # Ignore cudaMallocAsync checkPoolLiveAllocations errors
+            if "checkPoolLiveAllocations" not in str(e):
+                raise
+        
         unet_path = folder_paths.get_full_path("diffusion_models", unet_name)
         
         # Use Int8TensorwiseOps for proper direct int8 loading
         model_options = {"custom_operations": Int8TensorwiseOps}
         
-        # We need to peek at the model type to set exclusions for Flux
-        # ComfyUI loads metadata before the full model
-        from comfy.sd import load_diffusion_model
+        # Set offloading preference
+        offload_enabled = (offload_to_cpu == "enable")
+        Int8TensorwiseOps.offload_to_cpu = offload_enabled
+        Int8TensorwiseOps.chunk_size = chunk_size
+        
+        # Set auto-convert preference (for loading non-INT8 models like flux2 klein)
+        Int8TensorwiseOps.auto_convert_to_int8 = (auto_convert_to_int8 == "enable")
         
         # Reset exclusions (in case this is the second load)
         Int8TensorwiseOps.excluded_names = []
@@ -46,33 +67,18 @@ class UNetLoaderINTW8A8:
         # Check explicit model_type for exclusions
         if model_type == "flux2":
             Int8TensorwiseOps.excluded_names = [
-                'img_in', 'time_in', 'guidance_in', 'txt_in', 'final_layer', 
-                'double_stream_modulation_img', 'double_stream_modulation_txt', 
-                'single_stream_modulation',
+                'img_in', 'time_in', 'guidance_in', 'txt_in', 'final_layer',
+                'double_stream_modulation_img', 'double_stream_modulation_txt',
+                'single_stream_modulation'
             ]
-        elif model_type == "z-image":
+            #print(f"Applying Flux2-specific exclusions to Int8TensorwiseOps: {Int8TensorwiseOps.excluded_names}")
+        elif model_type in ["wan2.1", "wan2.2"]:
             Int8TensorwiseOps.excluded_names = [
-                'cap_embedder', 't_embedder', 'x_embedder', 'cap_pad_token', 'context_refiner', 
-                'final_layer', 'noise_refiner', 
-                'x_pad_token',
+                'patch_embed', 'text_projection', 'time_projection', 'head',
+                'modulation', 'guidance', 'img_emb', 'txt_emb', 'time_emb',
+                'final_layer', 'output_projection'
             ]
-        elif model_type == "chroma":
-            Int8TensorwiseOps.excluded_names = [
-                'distilled_guidance_layer', 'final_layer', 'img_in', 'txt_in', 'nerf_image_embedder',
-                 'nerf_blocks', 'nerf_final_layer_conv', '__x0__', 'nerf_final_layer_conv',
-            ]
-        elif model_type == "wan":
-            Int8TensorwiseOps.excluded_names = [
-                'patch_embedding', 'text_embedding', 'time_embedding', 'time_projection' 'head',
-                'img_emb',
-            ]
-        elif model_type == "ltx2":
-            Int8TensorwiseOps.excluded_names = [
-                'adaln_single', 'audio_adaln_single', 'audio_caption_projection', 'audio_patchify_proj', 'audio_proj_out',
-                'audio_scale_shift_table', 'av_ca_a2v_gate_adaln_single', 'av_ca_audio_scale_shift_adaln_single', 'av_ca_v2a_gate_adaln_single',
-                'av_ca_video_scale_shift_adaln_single', 'caption_projection', 'patchify_proj', 'proj_out', 'scale_shift_table',
-            ]
-            #print(f"Applying model-specific exclusions to Int8TensorwiseOps: {Int8TensorwiseOps.excluded_names}")
+            #print(f"Applying Wan-specific exclusions to Int8TensorwiseOps: {Int8TensorwiseOps.excluded_names}")
 
         # Load model directly - Int8TensorwiseOps handles int8 weights natively
         model = load_diffusion_model(unet_path, model_options=model_options)
