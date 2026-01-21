@@ -21,7 +21,7 @@ class UNetLoaderINTW8A8:
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
                 "weight_dtype": (["default", "fp8_e4m3fn", "fp16", "bf16"],),
-                "model_type": (["flux2","z-image","chroma"],),
+                "model_type": (["flux2","z-image","chroma", "wan", "ltx2"],),
             }
         }
 
@@ -48,20 +48,31 @@ class UNetLoaderINTW8A8:
             Int8TensorwiseOps.excluded_names = [
                 'img_in', 'time_in', 'guidance_in', 'txt_in', 'final_layer', 
                 'double_stream_modulation_img', 'double_stream_modulation_txt', 
-                'single_stream_modulation'
+                'single_stream_modulation',
             ]
         elif model_type == "z-image":
             Int8TensorwiseOps.excluded_names = [
                 'cap_embedder', 't_embedder', 'x_embedder', 'cap_pad_token', 'context_refiner', 
                 'final_layer', 'noise_refiner', 
-                'x_pad_token'
+                'x_pad_token',
             ]
         elif model_type == "chroma":
             Int8TensorwiseOps.excluded_names = [
-                'distilled_guidance_layer', 'final_layer', 'img_in', 'txt_in' 'nerf_image_embedder',
-                 'nerf_blocks', 'nerf_final_layer_conv'
+                'distilled_guidance_layer', 'final_layer', 'img_in', 'txt_in', 'nerf_image_embedder',
+                 'nerf_blocks', 'nerf_final_layer_conv', '__x0__', 'nerf_final_layer_conv',
             ]
-            #print(f"Applying Flux2-specific exclusions to Int8TensorwiseOps: {Int8TensorwiseOps.excluded_names}")
+        elif model_type == "wan":
+            Int8TensorwiseOps.excluded_names = [
+                'patch_embedding', 'text_embedding', 'time_embedding', 'time_projection' 'head',
+                'img_emb',
+            ]
+        elif model_type == "ltx2":
+            Int8TensorwiseOps.excluded_names = [
+                'adaln_single', 'audio_adaln_single', 'audio_caption_projection', 'audio_patchify_proj', 'audio_proj_out',
+                'audio_scale_shift_table', 'av_ca_a2v_gate_adaln_single', 'av_ca_audio_scale_shift_adaln_single', 'av_ca_v2a_gate_adaln_single',
+                'av_ca_video_scale_shift_adaln_single', 'caption_projection', 'patchify_proj', 'proj_out', 'scale_shift_table',
+            ]
+            #print(f"Applying model-specific exclusions to Int8TensorwiseOps: {Int8TensorwiseOps.excluded_names}")
 
         # Load model directly - Int8TensorwiseOps handles int8 weights natively
         model = load_diffusion_model(unet_path, model_options=model_options)

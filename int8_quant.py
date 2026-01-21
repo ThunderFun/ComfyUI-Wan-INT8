@@ -396,12 +396,12 @@ if _COMFY_OPS_AVAILABLE:
                         
                         if is_excluded or is_dim1:
                             reason = "excluded" if is_excluded else "dim1/1D"
-                            print(f"Skipping dynamic quantization for {prefix.rstrip('.')} ({reason})")
+                            #print(f"Skipping dynamic quantization for {prefix.rstrip('.')} ({reason})")
                             self._is_quantized = False
                             self.weight = nn.Parameter(weight_tensor, requires_grad=False)
                         else:
                             # This restores the dynamic quantization lost in the transition to custom ops.
-                            print(f"Dynamic quantization: {prefix.rstrip('.')} ({weight_tensor.dtype} -> INT8)")
+                            #print(f"Dynamic quantization: {prefix.rstrip('.')} ({weight_tensor.dtype} -> INT8)")
                             q_weight, q_scale = quantize_int8_tensorwise(weight_tensor)
                             self.weight = nn.Parameter(q_weight, requires_grad=False)
                             self.weight_scale = q_scale
