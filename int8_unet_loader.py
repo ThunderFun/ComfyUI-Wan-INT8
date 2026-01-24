@@ -4,10 +4,13 @@ import folder_paths
 import comfy.sd
 import comfy.utils
 
-from .int8_quant import Int8TensorwiseOps
+try:
+    from .int8_quant import Int8TensorwiseOps
+except ImportError:
+    Int8TensorwiseOps = None
 
 
-class UNetLoaderINTW8A8:
+class WanVideoINT8Loader:
     """
     Load INT8 tensorwise quantized diffusion models.
     
@@ -20,7 +23,7 @@ class UNetLoaderINTW8A8:
         return {
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
-                "model_type": (["flux2", "wan2.1", "wan2.2"],),
+                "model_type": (["wan2.2", "wan2.1", "flux2"],),
                 "offload_to_cpu": (["enable", "disable"],),
                 "chunk_size": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 512}),
                 "auto_convert_to_int8": (["enable", "disable"],),
@@ -29,7 +32,7 @@ class UNetLoaderINTW8A8:
 
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load_unet"
-    CATEGORY = "loaders"
+    CATEGORY = "WanVideo/INT8"
     DESCRIPTION = "Load INT8 tensorwise quantized models with fast torch._int_mm inference."
 
     def load_unet(self, unet_name, model_type, offload_to_cpu, chunk_size, auto_convert_to_int8):
@@ -54,6 +57,8 @@ class UNetLoaderINTW8A8:
         model_options = {"custom_operations": Int8TensorwiseOps}
         
         # Set offloading preference
+        # NOTE: These class-level attributes are not thread-safe if multiple models 
+        # are loaded concurrently, but ComfyUI typically loads models sequentially.
         offload_enabled = (offload_to_cpu == "enable")
         Int8TensorwiseOps.offload_to_cpu = offload_enabled
         Int8TensorwiseOps.chunk_size = chunk_size
@@ -84,4 +89,3 @@ class UNetLoaderINTW8A8:
         model = load_diffusion_model(unet_path, model_options=model_options)
         
         return (model,)
-
