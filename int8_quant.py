@@ -5,91 +5,6 @@ import torch.nn.functional as F
 #The most important parts in the following are basically fully taken from OneTrainer.
 
 
-# --- Triton Support ---
-try:
-    import triton
-    import triton.language as tl
-
-    @triton.autotune(
-        configs=[
-            triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128}, num_stages=4, num_warps=4),
-            triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
-            triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 128}, num_stages=3, num_warps=8),
-            triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64}, num_stages=3, num_warps=8),
-            triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
-            triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64}, num_stages=4, num_warps=4),
-            triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128}, num_stages=3, num_warps=8),
-            triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64}, num_stages=4, num_warps=4),
-            # Low-VRAM configs
-            triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32}, num_stages=2, num_warps=4),
-            triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32}, num_stages=2, num_warps=4),
-        ],
-        key=['QUANTIZED_M', 'N', 'K', 'stride_bk'],
-    )
-    @triton.jit
-    def __mm_kernel(
-            a_ptr, b_ptr, c_ptr,
-            M, N, K,
-            stride_am, stride_ak,
-            stride_bk, stride_bn,
-            stride_cm, stride_cn,
-            BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-            QUANTIZED_M,
-            FLOAT: tl.constexpr,
-    ):
-        pid_n = tl.program_id(axis=0)
-        pid_m = tl.program_id(axis=1)
-
-        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-        offs_k = tl.arange(0, BLOCK_SIZE_K)
-        a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-        b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-
-        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32 if FLOAT else tl.int32)
-
-        for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
-            a_mask = (offs_am[:, None] < M) & (offs_k[None, :] < K - k * BLOCK_SIZE_K)
-            b_mask = (offs_bn[None, :] < N) & (offs_k[:, None] < K - k * BLOCK_SIZE_K)
-            a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-            b = tl.load(b_ptrs, mask=b_mask, other=0.0)
-            accumulator = tl.dot(a, b, accumulator, out_dtype=tl.float32 if FLOAT else tl.int32)
-            a_ptrs += BLOCK_SIZE_K * stride_ak
-            b_ptrs += BLOCK_SIZE_K * stride_bk
-
-        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        tl.store(c_ptrs, accumulator, mask=c_mask)
-
-    def mm_8bit_triton(a: Tensor, b: Tensor) -> Tensor:
-        FLOAT = (a.dtype == torch.float8_e4m3fn)
-        M, K = a.shape
-        K, N = b.shape
-        c = torch.empty((M, N), device=a.device, dtype=torch.float32 if FLOAT else torch.int32)
-        grid = lambda META: (triton.cdiv(N, META['BLOCK_SIZE_N']), triton.cdiv(M, META['BLOCK_SIZE_M']))
-        __mm_kernel[grid](
-            a, b, c, M, N, K,
-            a.stride(0), a.stride(1),
-            b.stride(0), b.stride(1),
-            c.stride(0), c.stride(1),
-            QUANTIZED_M=M // 64, FLOAT=FLOAT
-        )
-        return c
-
-except ImportError:
-    mm_8bit_triton = None
-
-def mm_8bit(a: Tensor, b: Tensor) -> Tensor:
-    if mm_8bit_triton is not None and a.is_cuda:
-        return mm_8bit_triton(a, b)
-    
-    if a.dtype == torch.int8:
-        return torch._int_mm(a, b)
-    else:
-        one = torch.ones(1, device=a.device)
-        return torch._scaled_mm(a, b.T.contiguous().T, scale_a=one, scale_b=one)
 
 # --- Quantization Utils ---
 
@@ -181,167 +96,6 @@ def int8_forward_static(x: Tensor, weight: Tensor, weight_scale: float | Tensor,
         res_scaled.add_(bias.to(compute_dtype))
     return res_scaled
 
-class LinearInt8Function(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x: Tensor, weight: Tensor, weight_scale: float | Tensor, bias: Tensor | None, compute_dtype: torch.dtype) -> Tensor:
-        return int8_forward_dynamic(x, weight, weight_scale, bias, compute_dtype)
-
-    @staticmethod
-    def backward(ctx, output: Tensor):
-        raise NotImplementedError("Int W8A8 backward is not implemented for this ComfyUI node.")
-
-class LinearW8A8(nn.Linear):
-    def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
-        super().__init__(in_features, out_features, bias, device, dtype)
-        self.register_buffer("scale", torch.tensor(1.0, dtype=torch.float32))
-        self.register_buffer("input_scale", None)  # Optional: learned input scale
-        self.__is_quantized = False
-        self.compute_dtype = torch.float16 # Default
-
-    @torch.no_grad()
-    def quantize(self):
-        if self.__is_quantized:
-            return
-        self.requires_grad_(False)
-        weight, scale = quantize_int8_tensorwise(self.weight.data)
-        self.weight.data = weight
-        self.scale.fill_(scale)
-        self.__is_quantized = True
-
-    @torch.no_grad()
-    def load_quantized(self, weight, weight_scale, input_scale=None):
-        self.requires_grad_(False)
-        self.weight.data = weight.to(self.weight.device)
-        self.scale.fill_(weight_scale)
-        if input_scale is not None:
-            if isinstance(input_scale, torch.Tensor):
-                self.input_scale = input_scale.to(self.weight.device, dtype=torch.float32).view(())
-            else:
-                self.input_scale = torch.tensor(input_scale, dtype=torch.float32, device=self.weight.device)
-        self.__is_quantized = True
-
-    def forward(self, x_orig: Tensor) -> Tensor:
-        if not self.__is_quantized:
-            return super().forward(x_orig)
-        
-        x = x_orig.reshape(-1, x_orig.shape[-1])
-        
-        if x.shape[0] > 16:
-            if self.input_scale is not None:
-                # Use learned static quantization
-                y = int8_forward_static(x, self.weight, self.scale, self.input_scale, self.bias, self.compute_dtype)
-            else:
-                # Fall back to dynamic quantization
-                y = int8_forward_dynamic(x, self.weight, self.scale, self.bias, self.compute_dtype)
-        else:
-            # For small batches, dequantize and use fp math
-            w = dequantize(self.weight, self.scale).to(x.dtype)
-            y = F.linear(x, w, self.bias)
-        
-        return y.reshape(x_orig.shape[:-1] + (y.shape[-1],))
-
-def apply_quantization(parent_module, compute_dtype=torch.float16, visited_modules=None, exclude_names=None, prefix="", state_dict=None):
-    if visited_modules is None:
-        visited_modules = set()
-        # Track statistics for this run
-        apply_quantization._stats = {"loaded_learned": 0, "quantized_on_fly": 0}
-    if exclude_names is None:
-        exclude_names = []
-    
-    if id(parent_module) in visited_modules:
-        return parent_module
-    visited_modules.add(id(parent_module))
-
-    def should_exclude(name):
-        return any(ex in name for ex in exclude_names)
-
-    def replace_linear(module, full_name, parent, key):
-        if should_exclude(full_name):
-            return False
-        
-        new_module = LinearW8A8(module.in_features, module.out_features, module.bias is not None)
-        
-        # Check for pre-quantized weights in state_dict
-        loaded_quant = False
-        if state_dict is not None:
-            weight_key = f"{full_name}.weight"
-            scale_key = f"{full_name}.weight_scale"
-            input_scale_key = f"{full_name}.input_scale"
-            
-            if weight_key in state_dict and scale_key in state_dict:
-                try:
-                    w_quant = state_dict[weight_key]
-                    s_quant = state_dict[scale_key]
-                    
-                    # NOTE: input_scale is NOT loaded because it's typically a placeholder (1.0)
-                    # from the conversion tool, not an actual learned value.
-                    # The --heur option only learns weight rounding, not input scales.
-                    # We use dynamic per-row activation quantization instead.
-                    input_scale_val = None
-                    
-                    if w_quant.dtype == torch.int8:
-                        # Handle tensor scale - extract scalar if needed
-                        if isinstance(s_quant, torch.Tensor):
-                            if s_quant.numel() == 1:
-                                scale_val = s_quant.item()
-                            else:
-                                print(f"Warning: {full_name} has non-scalar weight_scale, re-quantizing")
-                                scale_val = None
-                        else:
-                            scale_val = s_quant
-                        
-                        if scale_val is not None:
-                            new_module.load_quantized(w_quant, scale_val, input_scale_val)
-                            loaded_quant = True
-                            apply_quantization._stats["loaded_learned"] += 1
-                            if input_scale_val is not None:
-                                apply_quantization._stats["with_input_scale"] = apply_quantization._stats.get("with_input_scale", 0) + 1
-                except Exception as e:
-                    print(f"Failed to load quantized weights for {full_name}: {e}")
-
-        if not loaded_quant:
-            new_module.weight.data.copy_(module.weight.data)
-            new_module.quantize()
-            apply_quantization._stats["quantized_on_fly"] += 1
-        
-        if module.bias is not None:
-            new_module.bias.data.copy_(module.bias.data)
-        
-        new_module.compute_dtype = compute_dtype
-        new_module.to(module.weight.device)
-        
-        if isinstance(key, int):
-            parent[key] = new_module
-        else:
-            setattr(parent, key, new_module)
-        return True
-
-    if isinstance(parent_module, (nn.ModuleList, nn.Sequential)):
-        for i, module in enumerate(parent_module):
-            full_name = f"{prefix}.{i}" if prefix else str(i)
-            if isinstance(module, nn.Linear) and not isinstance(module, LinearW8A8):
-                replace_linear(module, full_name, parent_module, i)
-            else:
-                apply_quantization(module, compute_dtype, visited_modules, exclude_names, full_name, state_dict)
-    else:
-        for name, module in parent_module.named_children():
-            full_name = f"{prefix}.{name}" if prefix else name
-            if isinstance(module, nn.Linear) and not isinstance(module, LinearW8A8):
-                replace_linear(module, full_name, parent_module, name)
-            else:
-                apply_quantization(module, compute_dtype, visited_modules, exclude_names, full_name, state_dict)
-    
-    # Print stats at the end (when prefix is empty = top-level call)
-    if not prefix:
-        stats = apply_quantization._stats
-        input_scale_count = stats.get("with_input_scale", 0)
-        msg = f"Quantization complete: {stats['loaded_learned']} layers loaded from checkpoint"
-        if input_scale_count > 0:
-            msg += f" ({input_scale_count} with learned input_scale)"
-        msg += f", {stats['quantized_on_fly']} layers quantized on-the-fly"
-        print(msg)
-    
-    return parent_module
 
 
 # =============================================================================
@@ -402,6 +156,7 @@ if _COMFY_OPS_AVAILABLE:
                 self._is_quantized = False
                 self.compute_dtype = torch.bfloat16
                 self.comfy_cast_weights = True
+                self.lora_patches = []
             
             def reset_parameters(self):
                 # Skip weight initialization - we load from state dict
@@ -444,30 +199,37 @@ if _COMFY_OPS_AVAILABLE:
                         self.weight = nn.Parameter(weight_tensor, requires_grad=False)
                         
                         # Store scale as scalar or tensor
-                        if isinstance(weight_scale, torch.Tensor):
-                            if weight_scale.numel() == 1:
-                                self.weight_scale = weight_scale.float().item()
+                        if weight_scale is not None:
+                            if hasattr(self, "weight_scale"):
+                                if "weight_scale" in self._buffers:
+                                    del self._buffers["weight_scale"]
+                                else:
+                                    del self.weight_scale
+                            
+                            if isinstance(weight_scale, torch.Tensor):
+                                if weight_scale.numel() == self.out_features:
+                                    weight_scale = weight_scale.float().reshape(1, -1)
+                                else:
+                                    weight_scale = weight_scale.float().mean().view(())
                             else:
-                                if hasattr(self, "weight_scale"):
-                                    if "weight_scale" in self._buffers:
-                                        del self._buffers["weight_scale"]
-                                    else:
-                                        del self.weight_scale
-                                self.register_buffer("weight_scale", weight_scale.float())
-                        else:
-                            self.weight_scale = float(weight_scale)
+                                weight_scale = torch.tensor(weight_scale, dtype=torch.float32)
+                            
+                            self.register_buffer("weight_scale", weight_scale)
                         
                         # Store input scale if present (for static quantization)
                         if input_scale is not None:
+                            if hasattr(self, "input_scale"):
+                                if "input_scale" in self._buffers:
+                                    del self._buffers["input_scale"]
+                                else:
+                                    del self.input_scale
+                            
                             if isinstance(input_scale, torch.Tensor):
-                                if hasattr(self, "input_scale"):
-                                    if "input_scale" in self._buffers:
-                                        del self._buffers["input_scale"]
-                                    else:
-                                        del self.input_scale
-                                self.register_buffer("input_scale", input_scale.float())
+                                input_scale = input_scale.float().mean().view(())
                             else:
-                                self.input_scale = torch.tensor(input_scale, dtype=torch.float32)
+                                input_scale = torch.tensor(input_scale, dtype=torch.float32)
+                                
+                            self.register_buffer("input_scale", input_scale)
                     elif weight_tensor.dtype in (torch.float16, torch.bfloat16, torch.float32):
                         # High-precision weight - quantize on-the-fly if enabled
                         # This allows loading non-INT8 models (e.g., flux2 klein) and converting them
@@ -519,6 +281,16 @@ if _COMFY_OPS_AVAILABLE:
                     )
                     out = F.linear(x, weight, bias)
                     uncast_bias_weight(self, weight, bias, offload_stream)
+                    
+                    # Apply LoRA patches to non-quantized layer
+                    lora_patches = getattr(self, "lora_patches", [])
+                    if lora_patches:
+                        for down, up, alpha in lora_patches:
+                            d = down.to(device=out.device, dtype=out.dtype)
+                            u = up.to(device=out.device, dtype=out.dtype)
+                            lora_out = F.linear(F.linear(x, d), u)
+                            out.add_(lora_out, alpha=alpha)
+                            del d, u, lora_out
                     return out
                 
                 # Quantized path - use fast int8 matmul
@@ -554,6 +326,20 @@ if _COMFY_OPS_AVAILABLE:
                     y = F.linear(x_2d, w_float, bias)
                     del w_float
                 
+                # Apply LoRA patches
+                lora_patches = getattr(self, "lora_patches", [])
+                if lora_patches:
+                    for down, up, alpha in lora_patches:
+                        # Move LoRA weights to device if needed
+                        d = down.to(device=y.device, dtype=y.dtype)
+                        u = up.to(device=y.device, dtype=y.dtype)
+                        
+                        # Compute LoRA contribution: (x @ down.T) @ up.T
+                        # This is mathematically equivalent to x @ (up @ down)
+                        lora_out = F.linear(F.linear(x_2d, d), u)
+                        y.add_(lora_out, alpha=alpha)
+                        del d, u, lora_out
+
                 # Explicitly delete local references to GPU tensors to help GC
                 del weight, weight_scale, input_scale, bias
                 
