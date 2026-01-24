@@ -3,8 +3,7 @@ int88 - Fast INT8 Tensorwise Quantization for ComfyUI
 
 Provides:
 - Int8TensorwiseOps: Custom operations for direct int8 weight loading
-- OTUNetLoaderW8A8: Load int8 quantized diffusion models
-- OTCheckpointLoaderW8A8: Load int8 quantized checkpoints
+- WanVideoINT8Loader: Load int8 quantized diffusion models
 
 Uses torch._int_mm for blazing fast inference.
 """
@@ -71,7 +70,6 @@ _apply_cudagraph_compatibility_fix()
 # This is for metadata compatibility when saving/loading models
 try:
     from comfy.quant_ops import QUANT_ALGOS, register_layout_class, QuantizedLayout
-    import torch
 
     class Int8TensorwiseLayout(QuantizedLayout):
         """Minimal layout class to satisfy ComfyUI's registry requirements."""
@@ -119,12 +117,15 @@ try:
 except ImportError:
     Int8TensorwiseOps = None
 
-from .int8_unet_loader import UNetLoaderINTW8A8
-
+from .int8_unet_loader import WanVideoINT8Loader
+from .wan_lora_loader import WanLoRALoader
+ 
 NODE_CLASS_MAPPINGS = {
-    "OTUNetLoaderW8A8": UNetLoaderINTW8A8,
+    "WanVideoINT8Loader": WanVideoINT8Loader,
+    "WanLoRALoader": WanLoRALoader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "OTUNetLoaderW8A8": "Load Diffusion Model INT8 (W8A8)",
+    "WanVideoINT8Loader": "Wan Video INT8 Loader",
+    "WanLoRALoader": "Wan LoRA Loader (INT8)",
 }
