@@ -1,10 +1,17 @@
 # FORK EDITS
-- **INT8 Support:**  
+### INT8 Support:
   The **WAN 2.2** INT8 files are functional.
+  
+  [wan2.2_i2v_A14b_high_noise_int8_lightx2v_4step_1030.safetensors](https://huggingface.co/lightx2v/Wan2.2-Distill-Models)
+  
+  [wan2.2_i2v_A14b_low_noise_int8_lightx2v_4step.safetensors](https://huggingface.co/lightx2v/Wan2.2-Distill-Models)
 
-- **CPU Offloading (Always‑On, Buggy):** 
+### CPU Offloading (Always‑On, Buggy):
   Added offloading to the CPU, but it cannot currently be disabled and may exhibit bugs.
 
+### LoRA Support:
+- Introduced a custom LoRA node.  
+- Not thoroughly tested; sometimes works well, sometimes not.
 
 # Flux2 INT8 Acceleration
 
