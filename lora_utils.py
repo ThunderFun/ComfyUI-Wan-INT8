@@ -48,6 +48,19 @@ WAN_LORA_KEY_MAP = {
     
     r"lora_unet_blocks_(\d+)_ffn_0": "diffusion_model.blocks.{i}.ffn.0",
     r"lora_unet_blocks_(\d+)_ffn_2": "diffusion_model.blocks.{i}.ffn.2",
+
+    # Flux patterns (Kohya/X-Labs style)
+    r"lora_unet_double_blocks_(\d+)_img_attn_qkv": "diffusion_model.double_blocks.{i}.img_attn.qkv",
+    r"lora_unet_double_blocks_(\d+)_img_attn_proj": "diffusion_model.double_blocks.{i}.img_attn.proj",
+    r"lora_unet_double_blocks_(\d+)_txt_attn_qkv": "diffusion_model.double_blocks.{i}.txt_attn.qkv",
+    r"lora_unet_double_blocks_(\d+)_txt_attn_proj": "diffusion_model.double_blocks.{i}.txt_attn.proj",
+    r"lora_unet_double_blocks_(\d+)_img_mlp_0": "diffusion_model.double_blocks.{i}.img_mlp.0",
+    r"lora_unet_double_blocks_(\d+)_img_mlp_2": "diffusion_model.double_blocks.{i}.img_mlp.2",
+    r"lora_unet_double_blocks_(\d+)_txt_mlp_0": "diffusion_model.double_blocks.{i}.txt_mlp.0",
+    r"lora_unet_double_blocks_(\d+)_txt_mlp_2": "diffusion_model.double_blocks.{i}.txt_mlp.2",
+    
+    r"lora_unet_single_blocks_(\d+)_linear1": "diffusion_model.single_blocks.{i}.linear1",
+    r"lora_unet_single_blocks_(\d+)_linear2": "diffusion_model.single_blocks.{i}.linear2",
 }
 
 class LoRAWeights:
@@ -56,10 +69,12 @@ class LoRAWeights:
         self.device = torch.device("cpu")
     
     def add(self, key: str, down: Tensor, up: Tensor, alpha: float = 1.0):
-        # Keep in float16/bfloat16 for quality and memory efficiency
+        # Convert to float16 for consistency and to avoid bfloat16->float16 conversion issues
+        # bfloat16->float16 conversion can introduce non-determinism during inference
+        target_dtype = torch.float16 if down.dtype in (torch.bfloat16, torch.float32) else down.dtype
         self.weights[key] = (
-            down.to(self.device),
-            up.to(self.device),
+            down.to(device=self.device, dtype=target_dtype),
+            up.to(device=self.device, dtype=target_dtype),
             alpha
         )
     
@@ -92,29 +107,49 @@ def parse_wan_lora(state_dict, strength=1.0):
     
     if lora_format == "kohya":
         # Kohya format: lora_transformer_blocks_0_attn_to_q.lora_down.weight
-        for key in state_dict:
+        keys = list(state_dict.keys())
+        for key in keys:
             if ".lora_down.weight" in key:
                 base_key = key.replace(".lora_down.weight", "")
                 groups[base_key] = {
-                    "down": state_dict[key],
-                    "up": state_dict[base_key + ".lora_up.weight"],
-                    "alpha": state_dict.get(base_key + ".alpha", None)
+                    "down": state_dict.pop(key),
+                    "up": state_dict.pop(base_key + ".lora_up.weight"),
+                    "alpha": state_dict.pop(base_key + ".alpha", None)
                 }
     elif lora_format == "peft":
         # PEFT format: base_model.model.diffusion_model.blocks.0.self_attn.to_q.lora_A.weight
-        for key in state_dict:
-            if ".lora_A.weight" in key:
-                base_key = key.replace(".lora_A.weight", "")
-                # Map PEFT keys back to model keys if they contain the full path
-                model_key = base_key
-                if model_key.startswith("base_model.model."):
-                    model_key = model_key[len("base_model.model."):]
+        keys = list(state_dict.keys())
+        for key in keys:
+            if key not in state_dict: continue
+            # Handle both .lora_A.weight and .lora_A.default.weight patterns
+            if ".lora_A.weight" in key or ".lora_A.default.weight" in key:
+                if ".lora_A.default.weight" in key:
+                    base_key = key.replace(".lora_A.default.weight", "")
+                    lora_b_key = base_key + ".lora_B.default.weight"
+                else:
+                    base_key = key.replace(".lora_A.weight", "")
+                    lora_b_key = base_key + ".lora_B.weight"
                 
-                groups[model_key] = {
-                    "down": state_dict[key],
-                    "up": state_dict[base_key + ".lora_B.weight"],
-                    "alpha": None # PEFT usually doesn't have alpha in state_dict or uses it differently
-                }
+                if lora_b_key not in state_dict: continue
+                
+                # Map PEFT keys back to model keys
+                model_key = base_key
+                prefixes_to_strip = ["base_model.model.model.", "base_model.model.", "model."]
+                for prefix in prefixes_to_strip:
+                    if model_key.startswith(prefix):
+                        model_key = model_key[len(prefix):]
+                        break
+                
+                down_weight = state_dict.pop(key)
+                up_weight = state_dict.pop(lora_b_key)
+                
+                alpha_value = None
+                for alpha_key in [base_key + ".alpha", base_key + ".lora_alpha", base_key + ".scaling"]:
+                    if alpha_key in state_dict:
+                        alpha_value = state_dict.pop(alpha_key)
+                        break
+                
+                groups[model_key] = {"down": down_weight, "up": up_weight, "alpha": alpha_value}
     elif lora_format == "standard":
         # Standard format: diffusion_model.blocks.0.self_attn.to_q.down.weight
         for key in state_dict:

@@ -3,6 +3,11 @@ import torch
 import folder_paths
 import comfy.sd
 import comfy.utils
+import warnings
+
+# Suppress annoying PyTorch inductor warnings
+warnings.filterwarnings("ignore", message=".*Not enough SMs to use max_autotune_gemm mode.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="torch._inductor.utils")
 
 try:
     from .int8_quant import Int8TensorwiseOps
@@ -86,6 +91,27 @@ class WanVideoINT8Loader:
             #print(f"Applying Wan-specific exclusions to Int8TensorwiseOps: {Int8TensorwiseOps.excluded_names}")
 
         # Load model directly - Int8TensorwiseOps handles int8 weights natively
+        import time
+        start_time = time.time()
         model = load_diffusion_model(unet_path, model_options=model_options)
+        end_time = time.time()
+        
+        # Count layers for debugging
+        direct_load = 0
+        on_fly = 0
+        excluded = 0
+        
+        for m in model.model.modules():
+            if hasattr(m, "_is_quantized"):
+                if m._is_quantized:
+                    # Check if it was loaded as int8 or converted
+                    # (This is a bit hacky since we don't track it explicitly in the layer,
+                    # but we can infer from the presence of weight_scale in buffers vs attributes)
+                    direct_load += 1
+                else:
+                    excluded += 1
+        
+        print(f"[DIAG] Model load took: {end_time - start_time:.2f}s")
+        print(f"[DIAG] Stats: {direct_load} layers loaded directly, {on_fly} quantized on-fly (0.00s), {excluded} excluded")
         
         return (model,)

@@ -177,13 +177,18 @@ if _COMFY_OPS_AVAILABLE:
                 No dequant/requant needed!
                 """
                 weight_key = prefix + "weight"
-                scale_key = prefix + "weight_scale"
-                input_scale_key = prefix + "input_scale"
-                bias_key = prefix + "bias"
+                # Support multiple naming conventions for scales
+                weight_scale = state_dict.pop(prefix + "weight_scale",
+                               state_dict.pop(prefix + "scale",
+                               state_dict.pop(prefix + "weight.scale",
+                               state_dict.pop(prefix + "weight.weight_scale", None))))
                 
-                # Pop scale tensors (don't let parent class see them)
-                weight_scale = state_dict.pop(scale_key, None)
-                input_scale = state_dict.pop(input_scale_key, None)
+                input_scale = state_dict.pop(prefix + "input_scale",
+                              state_dict.pop(prefix + "act_scale",
+                              state_dict.pop(prefix + "input.scale",
+                              state_dict.pop(prefix + "input.input_scale", None))))
+                
+                bias_key = prefix + "bias"
                 
                 # Pop comfy_quant metadata if present
                 state_dict.pop(prefix + "comfy_quant", None)
@@ -191,12 +196,25 @@ if _COMFY_OPS_AVAILABLE:
                 # Get weight tensor
                 weight_tensor = state_dict.pop(weight_key, None)
                 
+                
                 if weight_tensor is not None:
+                    if weight_tensor.dtype == torch.int8 and weight_scale is None:
+                        print(f"INT8 Loader: WARNING - Found INT8 weight but NO SCALE for {prefix.rstrip('.')}")
+                    
                     # Check if this is an int8 quantized weight
                     if weight_tensor.dtype == torch.int8 and weight_scale is not None:
-                        # Direct int8 load - no dequant needed!
-                        self._is_quantized = True
-                        self.weight = nn.Parameter(weight_tensor, requires_grad=False)
+                        # Check if this layer should be excluded (even if it's already INT8)
+                        is_excluded = any(ex in prefix for ex in Int8TensorwiseOps.excluded_names)
+                        
+                        if is_excluded:
+                            # Dequantize back to float for sensitive layers
+                            self._is_quantized = False
+                            dequant_weight = dequantize(weight_tensor, weight_scale).to(torch.bfloat16)
+                            self.weight = nn.Parameter(dequant_weight, requires_grad=False)
+                        else:
+                            # Direct int8 load - no dequant needed!
+                            self._is_quantized = True
+                            self.weight = nn.Parameter(weight_tensor, requires_grad=False)
                         
                         # Store scale as scalar or tensor
                         if weight_scale is not None:
@@ -330,12 +348,16 @@ if _COMFY_OPS_AVAILABLE:
                 lora_patches = getattr(self, "lora_patches", [])
                 if lora_patches:
                     for down, up, alpha in lora_patches:
-                        # Move LoRA weights to device if needed
-                        d = down.to(device=y.device, dtype=y.dtype)
-                        u = up.to(device=y.device, dtype=y.dtype)
+                        target_dtype = y.dtype
+                        
+                        # Convert to target device/dtype - use contiguous() for deterministic behavior
+                        # We use float() before conversion to ensure we have a clean starting point if it's already float16
+                        # but the user wants to avoid bfloat16 -> float16.
+                        # If down is float16 and target is bfloat16, this is still a conversion.
+                        d = down.to(device=y.device, dtype=target_dtype).contiguous()
+                        u = up.to(device=y.device, dtype=target_dtype).contiguous()
                         
                         # Compute LoRA contribution: (x @ down.T) @ up.T
-                        # This is mathematically equivalent to x @ (up @ down)
                         lora_out = F.linear(F.linear(x_2d, d), u)
                         y.add_(lora_out, alpha=alpha)
                         del d, u, lora_out
@@ -348,22 +370,55 @@ if _COMFY_OPS_AVAILABLE:
         
         # Use standard ComfyUI implementations for non-Linear layers
         class GroupNorm(manual_cast.GroupNorm):
-            pass
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.lora_patches = []
         
         class LayerNorm(manual_cast.LayerNorm):
-            pass
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.lora_patches = []
         
         class Conv2d(manual_cast.Conv2d):
-            pass
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.lora_patches = []
+            
+            def forward(self, x):
+                out = super().forward(x)
+                lora_patches = getattr(self, "lora_patches", [])
+                if lora_patches:
+                    for down, up, alpha in lora_patches:
+                        d = down.to(device=out.device, dtype=out.dtype)
+                        u = up.to(device=out.device, dtype=out.dtype)
+                        # For Conv2d, LoRA is usually applied as 1x1 convolutions or similar
+                        # but most LoRAs for these models don't target Conv2d.
+                        # If they do, they are usually reshaped.
+                        # This is a simple implementation that assumes Linear-like LoRA
+                        # which might not be correct for all Conv2d LoRAs.
+                        # However, Wan/Flux LoRAs are almost exclusively Linear.
+                        try:
+                            lora_out = F.conv2d(F.conv2d(x, d), u)
+                            out.add_(lora_out, alpha=alpha)
+                        except Exception:
+                            pass
+                        del d, u
+                return out
         
         class Conv3d(manual_cast.Conv3d):
-            pass
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.lora_patches = []
         
         class ConvTranspose2d(manual_cast.ConvTranspose2d):
-            pass
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.lora_patches = []
         
         class Embedding(manual_cast.Embedding):
-            pass
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.lora_patches = []
         
         @classmethod
         def conv_nd(cls, dims, *args, **kwargs):
