@@ -11,7 +11,7 @@
 
 ### LoRA Support:
 - Introduced a custom LoRA node.  
-- Not thoroughly tested; it may work well in some cases and not in others, depending on how the LoRA was trained.
+- Not thoroughly tested; it may work well in some cases and not in others, depending on how the LoRA was trained or on the precision of the INT8 model.
 
 # Flux2 INT8 Acceleration
 
