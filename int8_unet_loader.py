@@ -29,8 +29,7 @@ class WanVideoINT8Loader:
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
                 "model_type": (["wan2.2", "wan2.1", "flux2"],),
-                "offload_to_cpu": (["enable", "disable"],),
-                "chunk_size": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 512}),
+                "offload_to_cpu": (["enable", "disable"], {"default": "disable"}),
                 "auto_convert_to_int8": (["enable", "disable"],),
             }
         }
@@ -40,7 +39,7 @@ class WanVideoINT8Loader:
     CATEGORY = "WanVideo/INT8"
     DESCRIPTION = "Load INT8 tensorwise quantized models with fast torch._int_mm inference."
 
-    def load_unet(self, unet_name, model_type, offload_to_cpu, chunk_size, auto_convert_to_int8):
+    def load_unet(self, unet_name, model_type, offload_to_cpu, auto_convert_to_int8):
         import comfy.model_management
         import gc
         from comfy.sd import load_diffusion_model
@@ -66,7 +65,6 @@ class WanVideoINT8Loader:
         # are loaded concurrently, but ComfyUI typically loads models sequentially.
         offload_enabled = (offload_to_cpu == "enable")
         Int8TensorwiseOps.offload_to_cpu = offload_enabled
-        Int8TensorwiseOps.chunk_size = chunk_size
         
         # Set auto-convert preference (for loading non-INT8 models like flux2 klein)
         Int8TensorwiseOps.auto_convert_to_int8 = (auto_convert_to_int8 == "enable")

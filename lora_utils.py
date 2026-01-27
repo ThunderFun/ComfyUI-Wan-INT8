@@ -46,8 +46,15 @@ WAN_LORA_KEY_MAP = {
     r"lora_unet_blocks_(\d+)_cross_attn_v": "diffusion_model.blocks.{i}.cross_attn.v",
     r"lora_unet_blocks_(\d+)_cross_attn_o": "diffusion_model.blocks.{i}.cross_attn.o",
     
+    r"lora_unet_blocks_(\d+)_cross_attn_k_img": "diffusion_model.blocks.{i}.cross_attn.k_img",
+    r"lora_unet_blocks_(\d+)_cross_attn_v_img": "diffusion_model.blocks.{i}.cross_attn.v_img",
+    r"diffusion_model\.blocks\.(\d+)\.cross_attn\.k_img": "diffusion_model.blocks.{i}.cross_attn.k_img",
+    r"diffusion_model\.blocks\.(\d+)\.cross_attn\.v_img": "diffusion_model.blocks.{i}.cross_attn.v_img",
+    
     r"lora_unet_blocks_(\d+)_ffn_0": "diffusion_model.blocks.{i}.ffn.0",
     r"lora_unet_blocks_(\d+)_ffn_2": "diffusion_model.blocks.{i}.ffn.2",
+    
+    r"diffusion_model\.img_emb\.proj\.(\d+)": "diffusion_model.img_emb.proj.{i}",
 
     # Flux patterns (Kohya/X-Labs style)
     r"lora_unet_double_blocks_(\d+)_img_attn_qkv": "diffusion_model.double_blocks.{i}.img_attn.qkv",
@@ -65,18 +72,48 @@ WAN_LORA_KEY_MAP = {
 
 class LoRAWeights:
     def __init__(self):
-        self.weights = {}  # key -> (lora_down, lora_up, alpha)
+        self.weights = {}  # key -> (lora_down, lora_up, alpha) or (lora_down, lora_up, down_scale, up_scale, alpha) for INT8
         self.device = torch.device("cpu")
+        self.is_int8 = {}  # Track which weights are INT8
     
-    def add(self, key: str, down: Tensor, up: Tensor, alpha: float = 1.0):
-        # Convert to float16 for consistency and to avoid bfloat16->float16 conversion issues
-        # bfloat16->float16 conversion can introduce non-determinism during inference
-        target_dtype = torch.float16 if down.dtype in (torch.bfloat16, torch.float32) else down.dtype
-        self.weights[key] = (
-            down.to(device=self.device, dtype=target_dtype),
-            up.to(device=self.device, dtype=target_dtype),
-            alpha
-        )
+    def add(self, key: str, down: Tensor, up: Tensor, alpha: float = 1.0, down_scale: Tensor | float = None, up_scale: Tensor | float = None):
+        """
+        Add LoRA weights. Supports both float and INT8 quantized weights.
+        
+        Args:
+            key: Layer key
+            down: Down projection weight (float or INT8)
+            up: Up projection weight (float or INT8)
+            alpha: LoRA alpha scaling factor
+            down_scale: Scale for INT8 down weight (required if down is INT8)
+            up_scale: Scale for INT8 up weight (required if up is INT8)
+        """
+        # Check if this is INT8 LoRA
+        is_int8 = down.dtype == torch.int8 and up.dtype == torch.int8
+        
+        if is_int8:
+            if down_scale is None or up_scale is None:
+                raise ValueError(f"INT8 LoRA weights require scales. Got down_scale={down_scale}, up_scale={up_scale}")
+            
+            # Store INT8 weights with their scales
+            self.weights[key] = (
+                down.to(device=self.device),
+                up.to(device=self.device),
+                down_scale if isinstance(down_scale, float) else down_scale.to(device=self.device),
+                up_scale if isinstance(up_scale, float) else up_scale.to(device=self.device),
+                alpha
+            )
+            self.is_int8[key] = True
+        else:
+            # Convert to float16 for consistency and to avoid bfloat16->float16 conversion issues
+            # bfloat16->float16 conversion can introduce non-determinism during inference
+            target_dtype = torch.float16 if down.dtype in (torch.bfloat16, torch.float32) else down.dtype
+            self.weights[key] = (
+                down.to(device=self.device, dtype=target_dtype),
+                up.to(device=self.device, dtype=target_dtype),
+                alpha
+            )
+            self.is_int8[key] = False
     
     def get_for_layer(self, key: str, device: torch.device):
         if key not in self.weights:
@@ -96,9 +133,16 @@ def detect_lora_format(state_dict):
     
     return "unknown"
 
-def parse_wan_lora(state_dict, strength=1.0):
+def parse_wan_lora(state_dict, strength=1.0, debug=False):
     lora_format = detect_lora_format(state_dict)
     print(f"Detected LoRA format: {lora_format}")
+    
+    if debug:
+        print(f"[DEBUG] Original LoRA state_dict keys ({len(state_dict)}):")
+        for i, key in enumerate(sorted(state_dict.keys())[:20]):  # Show first 20
+            print(f"  {i+1}. {key}")
+        if len(state_dict) > 20:
+            print(f"  ... and {len(state_dict) - 20} more")
     
     parsed_weights = LoRAWeights()
     
@@ -111,10 +155,20 @@ def parse_wan_lora(state_dict, strength=1.0):
         for key in keys:
             if ".lora_down.weight" in key:
                 base_key = key.replace(".lora_down.weight", "")
+                down_weight = state_dict.pop(key)
+                up_weight = state_dict.pop(base_key + ".lora_up.weight")
+                alpha = state_dict.pop(base_key + ".alpha", None)
+                
+                # Check for INT8 scales (pattern: .scale_weight)
+                down_scale = state_dict.pop(base_key + ".lora_down.scale_weight", None)
+                up_scale = state_dict.pop(base_key + ".lora_up.scale_weight", None)
+                
                 groups[base_key] = {
-                    "down": state_dict.pop(key),
-                    "up": state_dict.pop(base_key + ".lora_up.weight"),
-                    "alpha": state_dict.pop(base_key + ".alpha", None)
+                    "down": down_weight,
+                    "up": up_weight,
+                    "alpha": alpha,
+                    "down_scale": down_scale,
+                    "up_scale": up_scale
                 }
     elif lora_format == "peft":
         # PEFT format: base_model.model.diffusion_model.blocks.0.self_attn.to_q.lora_A.weight
@@ -149,23 +203,43 @@ def parse_wan_lora(state_dict, strength=1.0):
                         alpha_value = state_dict.pop(alpha_key)
                         break
                 
-                groups[model_key] = {"down": down_weight, "up": up_weight, "alpha": alpha_value}
+                # Check for INT8 scales
+                down_scale = state_dict.pop(base_key + ".lora_A.scale_weight",
+                                           state_dict.pop(base_key + ".lora_A.default.scale_weight", None))
+                up_scale = state_dict.pop(base_key + ".lora_B.scale_weight",
+                                         state_dict.pop(base_key + ".lora_B.default.scale_weight", None))
+                
+                groups[model_key] = {
+                    "down": down_weight,
+                    "up": up_weight,
+                    "alpha": alpha_value,
+                    "down_scale": down_scale,
+                    "up_scale": up_scale
+                }
     elif lora_format == "standard":
         # Standard format: diffusion_model.blocks.0.self_attn.to_q.down.weight
         for key in state_dict:
             if ".down.weight" in key:
                 base_key = key.replace(".down.weight", "")
+                down_scale = state_dict.get(base_key + ".down.scale_weight", None)
+                up_scale = state_dict.get(base_key + ".up.scale_weight", None)
                 groups[base_key] = {
                     "down": state_dict[key],
                     "up": state_dict[base_key + ".up.weight"],
-                    "alpha": state_dict.get(base_key + ".alpha", None)
+                    "alpha": state_dict.get(base_key + ".alpha", None),
+                    "down_scale": down_scale,
+                    "up_scale": up_scale
                 }
             elif ".down_proj.weight" in key:
                 base_key = key.replace(".down_proj.weight", "")
+                down_scale = state_dict.get(base_key + ".down_proj.scale_weight", None)
+                up_scale = state_dict.get(base_key + ".up_proj.scale_weight", None)
                 groups[base_key] = {
                     "down": state_dict[key],
                     "up": state_dict[base_key + ".up_proj.weight"],
-                    "alpha": state_dict.get(base_key + ".alpha", None)
+                    "alpha": state_dict.get(base_key + ".alpha", None),
+                    "down_scale": down_scale,
+                    "up_scale": up_scale
                 }
 
     # Map groups to model keys
@@ -193,7 +267,38 @@ def parse_wan_lora(state_dict, strength=1.0):
             scale = alpha / rank
         else:
             scale = 1.0
-            
-        parsed_weights.add(model_key, weights["down"], weights["up"], scale * strength)
+        
+        # Get scales for INT8 LoRA
+        down_scale = weights.get("down_scale", None)
+        up_scale = weights.get("up_scale", None)
+        
+        parsed_weights.add(
+            model_key,
+            weights["down"],
+            weights["up"],
+            scale * strength,
+            down_scale=down_scale,
+            up_scale=up_scale
+        )
+    
+    # Count INT8 vs float LoRA weights
+    int8_count = sum(1 for is_int8 in parsed_weights.is_int8.values() if is_int8)
+    float_count = len(parsed_weights.weights) - int8_count
+    
+    if int8_count > 0:
+        print(f"✓ Detected INT8 LoRA: {int8_count} layers quantized, {float_count} layers float")
+    
+    if debug:
+        print(f"\n[DEBUG] Parsed LoRA weights ({len(parsed_weights.weights)} keys):")
+        for i, key in enumerate(sorted(parsed_weights.weights.keys())[:20]):  # Show first 20
+            is_int8 = parsed_weights.is_int8[key]
+            if is_int8:
+                down, up, down_scale, up_scale, alpha = parsed_weights.weights[key]
+                print(f"  {i+1}. {key} (INT8, rank={down.shape[0]}, in={down.shape[1]}, out={up.shape[0]}, alpha={alpha:.4f})")
+            else:
+                down, up, alpha = parsed_weights.weights[key]
+                print(f"  {i+1}. {key} (float, rank={down.shape[0]}, in={down.shape[1]}, out={up.shape[0]}, alpha={alpha:.4f})")
+        if len(parsed_weights.weights) > 20:
+            print(f"  ... and {len(parsed_weights.weights) - 20} more")
         
     return parsed_weights
