@@ -118,37 +118,39 @@ def make_patched_forward(mod, orig_fwd):
         return out
     return patched_forward
 
-class WanLoRALoader:
+class WanLoRALoaderWithCLIP:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "model": ("MODEL",),
                 "lora_name": (folder_paths.get_filename_list("loras"),),
-                "strength": ("FLOAT", {"default": 1.0, "min": -2.0, "max": 2.0, "step": 0.01}),
+                "strength_model": ("FLOAT", {"default": 1.0, "min": -2.0, "max": 2.0, "step": 0.01}),
+                "strength_clip": ("FLOAT", {"default": 1.0, "min": -2.0, "max": 2.0, "step": 0.01}),
                 "offload_to_cpu": (["enable", "disable"], {"default": "disable"}),
             },
             "optional": {
+                "clip": ("CLIP",),
                 "debug": ("BOOLEAN", {"default": False}),
             }
         }
     
-    RETURN_TYPES = ("MODEL",)
+    RETURN_TYPES = ("MODEL", "CLIP")
     FUNCTION = "load_lora"
     CATEGORY = "WanVideo/INT8"
     
-    def load_lora(self, model, lora_name, strength, offload_to_cpu="disable", debug=False):
+    def load_lora(self, model, lora_name, strength_model, strength_clip, clip=None, offload_to_cpu="disable", debug=False):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             
-        if strength == 0:
-            return (model,)
+        if strength_model == 0 and strength_clip == 0:
+            return (model, clip)
 
         lora_path = folder_paths.get_full_path("loras", lora_name)
         if not lora_path:
             print(f"LoRA not found: {lora_name}")
-            return (model,)
+            return (model, clip)
 
         print(f"Loading LoRA: {lora_name}")
         
@@ -157,95 +159,122 @@ class WanLoRALoader:
         
         lora_state_dict = comfy.utils.load_torch_file(lora_path)
 
-        # Parse LoRA weights and map to model keys
-        lora_weights = parse_wan_lora(lora_state_dict, strength, debug=debug)
+        # Parse LoRA weights with strength 1.0, we'll apply strengths during patching
+        lora_weights = parse_wan_lora(lora_state_dict, 1.0, debug=debug)
         
         # Clear state dict immediately to save memory
         del lora_state_dict
         gc.collect()
         
-        # Clone model to avoid mutating the original patcher
+        # Patch Model
         new_model = model.clone()
-        
+        if strength_model != 0:
+            self.patch_patcher(new_model, lora_weights, strength_model, offload_enabled, debug, is_clip=False)
+            
+        # Patch CLIP
+        if clip is not None:
+            new_clip = clip.clone()
+            if strength_clip != 0:
+                # Check if LoRA contains any CLIP keys before attempting to patch
+                has_clip_keys = any("qwen3_4b" in k or "text_encoder" in k or ".layers." in k for k in lora_weights.weights.keys())
+                
+                if has_clip_keys:
+                    # CLIP in ComfyUI has a patcher attribute
+                    self.patch_patcher(new_clip.patcher, lora_weights, strength_clip, offload_enabled, debug, is_clip=True)
+                else:
+                    if debug:
+                        print("Skipping CLIP patching: No CLIP-specific keys found in LoRA")
+        else:
+            new_clip = None
+            
+        # Clear modules dict and collect garbage
+        gc.collect()
+                
+        return (new_model, new_clip)
+
+    def patch_patcher(self, patcher, lora_weights, strength, offload_enabled, debug, is_clip=False):
         # Get the underlying torch model
-        # In ComfyUI, model.model is the BaseModel
-        torch_model = new_model.model
+        torch_model = patcher.model
         
         # Map of module name -> module
         modules = dict(torch_model.named_modules())
         
         if debug:
-            print(f"\n[DEBUG] Available model modules ({len(modules)}):")
+            type_name = "CLIP" if is_clip else "Model"
+            print(f"\n[DEBUG] {type_name} Available modules ({len(modules)}):")
             linear_modules = [k for k, v in modules.items() if isinstance(v, torch.nn.Linear)]
-            print(f"[DEBUG] Linear modules: {len(linear_modules)}")
-            for i, key in enumerate(sorted(linear_modules)[:20]):  # Show first 20 Linear modules
-                mod = modules[key]
-                print(f"  {i+1}. {key} ({mod.weight.shape[0]}x{mod.weight.shape[1]})")
-            if len(linear_modules) > 20:
-                print(f"  ... and {len(linear_modules) - 20} more Linear modules")
-        
+            print(f"[DEBUG] {type_name} Linear modules: {len(linear_modules)}")
+            for i, key in enumerate(sorted(linear_modules)[:50]):
+                print(f"  {i+1}. {key}")
+            if len(linear_modules) > 50:
+                print(f"  ... and {len(linear_modules) - 50} more")
+
         patched_count = 0
         failed_count = 0
-        
-        failed_keys = []  # Track which keys failed
         dim_mismatch_count = 0
+        failed_keys = []
         
+        device = getattr(patcher, "load_device", torch.device("cpu"))
+
         for key in lora_weights.weights:
+            # Skip diffusion model keys when patching CLIP
+            if is_clip and key.startswith("diffusion_model."):
+                continue
+                
             target_module = None
             target_key = None
             
-            if debug:
-                print(f"\n[DEBUG] Processing LoRA key: {key}")
             
             # Generate candidate keys
             candidates = [key]
             
-            # 1. Prefix variations
-            if key.startswith("diffusion_model."):
-                candidates.append(key[len("diffusion_model."):])
+            if not is_clip:
+                # UNet variations
+                if key.startswith("diffusion_model."):
+                    candidates.append(key[len("diffusion_model."):])
+                else:
+                    candidates.append("diffusion_model." + key)
             else:
-                candidates.append("diffusion_model." + key)
-            
-            # 2. Attn variations
-            new_candidates = []
-            for c in candidates:
-                if ".self_attn." in c:
-                    new_candidates.append(c.replace(".self_attn.", ".attn."))
-                elif ".attn." in c:
-                    new_candidates.append(c.replace(".attn.", ".self_attn."))
-            candidates.extend(new_candidates)
-            
-            # 3. to_out variations
-            new_candidates = []
-            for c in candidates:
-                if ".to_out.0" in c:
-                    new_candidates.append(c.replace(".to_out.0", ".to_out"))
-                elif ".to_out" in c and ".to_out.0" not in c:
-                    new_candidates.append(c.replace(".to_out", ".to_out.0"))
-            candidates.extend(new_candidates)
-            
-            # 4. q/k/v/o variations
-            new_candidates = []
-            replacements = [
-                # Single projection mappings
+                # CLIP variations
+                # Try stripping common prefixes
+                for prefix in ["text_encoders.", "lora_te.", "lora_te1.", "lora_te2.", "te_model."]:
+                    if key.startswith(prefix):
+                        candidates.append(key[len(prefix):])
+
+            # Common variations and replacements
+            # We use a list of potential transformations to avoid circular replacements
+            transformations = [
+                (".self_attn.", ".attn."), (".attn.", ".self_attn."),
+                (".to_out.0", ".to_out"), (".to_out", ".to_out.0"),
                 (".to_q", ".q"), (".to_k", ".k"), (".to_v", ".v"), (".to_out", ".o"),
                 (".q", ".to_q"), (".k", ".to_k"), (".v", ".to_v"), (".o", ".to_out"),
-                # Fused QKV mappings
                 (".to_q", ".qkv"), (".to_k", ".qkv"), (".to_v", ".qkv"),
-                (".q_proj", ".qkv"), (".k_proj", ".qkv"), (".v_proj", ".qkv"),
-                # Output mappings
                 (".to_out.0", ".out"), (".to_out", ".out"),
+                (".q_proj", ".qkv"), (".k_proj", ".qkv"), (".v_proj", ".qkv"),
             ]
-            for c in candidates:
-                for old, new in replacements:
-                    if old in c:
-                        new_candidates.append(c.replace(old, new))
-            candidates.extend(new_candidates)
             
-            if debug:
-                print(f"[DEBUG] Generated {len(candidates)} candidates")
+            current_candidates = set(candidates)
+            # Apply transformations iteratively to handle multiple changes (e.g. layers->blocks AND attention->self_attn)
+            for _ in range(3):
+                new_cands = set()
+                for c in current_candidates:
+                    for old, new in transformations:
+                        if old in c:
+                            new_cands.add(c.replace(old, new))
+                if not new_cands:
+                    break
+                if new_cands.issubset(current_candidates):
+                    break
+                current_candidates.update(new_cands)
+            # Add diffusion_model prefix back to all candidates if it was there originally
+            if key.startswith("diffusion_model."):
+                for c in list(current_candidates):
+                    if not c.startswith("diffusion_model."):
+                        current_candidates.add("diffusion_model." + c)
             
-            # 5. Remove duplicates and try matching
+            candidates = list(current_candidates)
+            
+            # Remove duplicates and try matching
             patch_offset = 0
             patch_size = 0
             
@@ -269,36 +298,37 @@ class WanLoRALoader:
                             patch_size = target_module.weight.shape[0] // 3
                             patch_offset = patch_size * 2
                     
-                    if debug:
-                        print(f"[DEBUG] ✓ Matched to model key: {target_key} (offset={patch_offset}, size={patch_size})")
                     break
+            
+            # Fallback for CLIP: try underscore to dot conversion
+            if is_clip and target_module is None:
+                for cand in candidates:
+                    if "_" in cand:
+                        dot_cand = cand.replace("_", ".")
+                        if dot_cand in modules:
+                            target_module = modules[dot_cand]
+                            target_key = dot_cand
+                            break
 
             if target_module is not None:
                 # If module doesn't have lora_patches, try to add it and patch forward
                 if not hasattr(target_module, "lora_patches"):
                     if isinstance(target_module, torch.nn.Linear):
                         target_module.lora_patches = []
-                        
-                        # Patch forward method to support lora_patches
                         original_forward = target_module.forward
                         target_module.forward = make_patched_forward(target_module, original_forward)
 
                 if hasattr(target_module, "lora_patches"):
-                    # Check if this is INT8 LoRA
                     is_int8 = lora_weights.is_int8.get(key, False)
-                    
                     if is_int8:
-                        # INT8 LoRA: (down, up, down_scale, up_scale, alpha)
                         down, up, down_scale, up_scale, alpha = lora_weights.weights[key]
                     else:
-                        # Float LoRA: (down, up, alpha)
                         down, up, alpha = lora_weights.weights[key]
                         down_scale = None
                         up_scale = None
                     
-                    # Dimension validation
-                    # down: (rank, in_features), up: (out_features, rank)
-                    # Linear weight: (out_features, in_features)
+                    alpha = alpha * strength
+                    
                     if hasattr(target_module, "weight"):
                         expected_out, expected_in = target_module.weight.shape
                         actual_out, actual_rank = up.shape
@@ -308,69 +338,35 @@ class WanLoRALoader:
                         validation_out = patch_size if patch_size > 0 else expected_out
                         
                         if validation_out != actual_out or expected_in != actual_in:
-                            print(f"  [!] Dimension mismatch for {target_key}:")
-                            print(f"      Model: {validation_out}x{expected_in} (Total: {expected_out})")
-                            print(f"      LoRA:  {actual_out}x{actual_in} (rank {actual_rank})")
+                            if debug:
+                                print(f"  [!] Dimension mismatch for {target_key}: Model {validation_out}x{expected_in} (Total: {expected_out}), LoRA {actual_out}x{actual_in}")
                             dim_mismatch_count += 1
                             continue
-    
-                    # Get current patches from the module (might be already patched)
+                            
                     current_patches = getattr(target_module, "lora_patches", [])
-                    
-                    # Cache weights on device to avoid redundant transfers on every forward
-                    # We use the model's load_device if available
-                    device = getattr(model, "load_device", torch.device("cpu"))
-                    
                     if is_int8 or not offload_enabled:
-                        # Move to device during loading if it's INT8 or offloading is disabled
                         down = down.to(device=device, non_blocking=True)
                         up = up.to(device=device, non_blocking=True)
                         if isinstance(down_scale, torch.Tensor):
                             down_scale = down_scale.to(device=device, non_blocking=True)
                         if isinstance(up_scale, torch.Tensor):
                             up_scale = up_scale.to(device=device, non_blocking=True)
-                    # If offload_enabled is True and it's a float LoRA, we keep it on CPU to save VRAM
-                    # and only move it to device during the forward pass.
-
+                    
                     # Create a new list with the additional patch
                     # Store as (down, up, alpha, down_scale, up_scale, offset, size)
                     patch_tuple = (down, up, alpha, down_scale, up_scale, patch_offset, patch_size)
                     new_patches = current_patches + [patch_tuple]
-                    
-                    # DIRECTLY set the attribute on the module.
-                    # ComfyUI's set_model_patch_replace is for attention processors,
-                    # not for arbitrary attributes on INT8 modules.
                     target_module.lora_patches = new_patches
-                    
-                    # Also register it in the patcher so it's tracked (optional but good for compatibility)
                     try:
-                        new_model.set_model_patch_replace(new_patches, target_key, "lora_patches")
+                        patcher.set_model_patch_replace(new_patches, target_key, "lora_patches")
                     except Exception:
                         pass
-                        
                     patched_count += 1
-                else:
-                    # Module found but doesn't support lora_patches (e.g. not an INT8 Linear)
-                    pass
             else:
                 failed_count += 1
                 failed_keys.append(key)
-                if debug:
-                    print(f"[DEBUG] ✗ Failed to match key - tried {len(seen)} candidates")
 
-        print(f"LoRA Application Summary:")
-        print(f"  - Successfully patched: {patched_count} layers")
-        if dim_mismatch_count > 0:
-            print(f"  - Dimension mismatches: {dim_mismatch_count} (skipped)")
-        if failed_count > 0:
-            print(f"  - Keys not found in model: {failed_count}")
-            if debug:
-                print(f"\n[DEBUG] Failed keys:")
-                for fk in failed_keys:
-                    print(f"  - {fk}")
-        
-        # Clear modules dict and collect garbage
-        del modules
-        gc.collect()
-                
-        return (new_model,)
+        type_name = "CLIP" if is_clip else "Model"
+        print(f"{type_name} LoRA Application Summary: Patched {patched_count} layers, {failed_count} keys not found")
+        if debug and failed_count > 0:
+            print(f"[DEBUG] {type_name} First 5 failed keys: {failed_keys[:5]}")

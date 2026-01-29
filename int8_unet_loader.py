@@ -5,14 +5,14 @@ import comfy.sd
 import comfy.utils
 import warnings
 
-# Suppress annoying PyTorch inductor warnings
 warnings.filterwarnings("ignore", message=".*Not enough SMs to use max_autotune_gemm mode.*")
 warnings.filterwarnings("ignore", category=UserWarning, module="torch._inductor.utils")
 
 try:
-    from .int8_quant import Int8TensorwiseOps
+    from .int8_quant import Int8TensorwiseOps, _loading_stats
 except ImportError:
     Int8TensorwiseOps = None
+    _loading_stats = {"int8_direct": 0, "quantized_on_fly": 0, "excluded": 0, "quantize_time": 0.0}
 
 
 class WanVideoINT8Loader:
@@ -20,7 +20,7 @@ class WanVideoINT8Loader:
     Load INT8 tensorwise quantized diffusion models.
     
     Uses Int8TensorwiseOps for direct int8 loading.
-    Inference uses fast torch._int_mm for blazing speed. (insert rocket emoji, fire emoji to taste)
+    Inference uses fast torch._int_mm for blazing speed.
     """
     
     @classmethod
@@ -28,9 +28,10 @@ class WanVideoINT8Loader:
         return {
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
-                "model_type": (["wan2.2", "wan2.1", "flux2"],),
+                "model_type": (["wan2.2", "wan2.1", "flux2", "z-image"],),
                 "offload_to_cpu": (["enable", "disable"], {"default": "disable"}),
-                "auto_convert_to_int8": (["enable", "disable"],),
+                "auto_convert_to_int8": (["enable", "disable"], {"default": "enable"}),
+                "debug_mode": ("BOOLEAN", {"default": False}),
             }
         }
 
@@ -39,77 +40,188 @@ class WanVideoINT8Loader:
     CATEGORY = "WanVideo/INT8"
     DESCRIPTION = "Load INT8 tensorwise quantized models with fast torch._int_mm inference."
 
-    def load_unet(self, unet_name, model_type, offload_to_cpu, auto_convert_to_int8):
+    def load_unet(self, unet_name, model_type, offload_to_cpu, auto_convert_to_int8, debug_mode):
         import comfy.model_management
         import gc
         from comfy.sd import load_diffusion_model
+        from . import int8_quant
         
-        # === CRITICAL: Free memory BEFORE loading new model ===
-        # This prevents OOM when loading a second model (e.g., Wan 2.2 low after Wan 2.2 high)
+        is_debug = debug_mode
+        Int8TensorwiseOps.debug_mode = is_debug
+        int8_quant._DEBUG_MODE = is_debug
+        
         comfy.model_management.unload_all_models()
         gc.collect()
         try:
             comfy.model_management.soft_empty_cache()
         except RuntimeError as e:
-            # Ignore cudaMallocAsync checkPoolLiveAllocations errors
             if "checkPoolLiveAllocations" not in str(e):
                 raise
         
         unet_path = folder_paths.get_full_path("diffusion_models", unet_name)
         
-        # Use Int8TensorwiseOps for proper direct int8 loading
         model_options = {"custom_operations": Int8TensorwiseOps}
         
-        # Set offloading preference
-        # NOTE: These class-level attributes are not thread-safe if multiple models 
-        # are loaded concurrently, but ComfyUI typically loads models sequentially.
         offload_enabled = (offload_to_cpu == "enable")
         Int8TensorwiseOps.offload_to_cpu = offload_enabled
         
-        # Set auto-convert preference (for loading non-INT8 models like flux2 klein)
         Int8TensorwiseOps.auto_convert_to_int8 = (auto_convert_to_int8 == "enable")
         
-        # Reset exclusions (in case this is the second load)
         Int8TensorwiseOps.excluded_names = []
+        _loading_stats["int8_direct"] = 0
+        _loading_stats["quantized_on_fly"] = 0
+        _loading_stats["excluded"] = 0
+        _loading_stats["quantize_time"] = 0.0
         
-        # Check explicit model_type for exclusions
         if model_type == "flux2":
             Int8TensorwiseOps.excluded_names = [
                 'img_in', 'time_in', 'guidance_in', 'txt_in', 'final_layer',
                 'double_stream_modulation_img', 'double_stream_modulation_txt',
                 'single_stream_modulation'
             ]
-            #print(f"Applying Flux2-specific exclusions to Int8TensorwiseOps: {Int8TensorwiseOps.excluded_names}")
+        elif model_type == "z-image":
+            Int8TensorwiseOps.excluded_names = [
+                'cap_embedder', 't_embedder', 'x_embedder', 'cap_pad_token', 'context_refiner', 
+                'final_layer', 'noise_refiner', 'adaLN',
+                'x_pad_token',
+            ]
         elif model_type in ["wan2.1", "wan2.2"]:
             Int8TensorwiseOps.excluded_names = [
                 'patch_embed', 'text_projection', 'time_projection', 'head',
                 'modulation', 'guidance', 'img_emb', 'txt_emb', 'time_emb',
                 'final_layer', 'output_projection'
             ]
-            #print(f"Applying Wan-specific exclusions to Int8TensorwiseOps: {Int8TensorwiseOps.excluded_names}")
 
-        # Load model directly - Int8TensorwiseOps handles int8 weights natively
         import time
+        import comfy.utils
+        from .int8_quant import convert_zimage_diffusers_state_dict, is_diffusers_zimage_format
+        
         start_time = time.time()
-        model = load_diffusion_model(unet_path, model_options=model_options)
+        
+        original_load_torch_file = comfy.utils.load_torch_file
+        
+        def patched_load_torch_file(*args, **kwargs):
+            if is_debug:
+                print(f"[z-image] patched_load_torch_file called for {args[0]}")
+            result = original_load_torch_file(*args, **kwargs)
+            
+            if isinstance(result, tuple):
+                sd, metadata = result
+                if is_diffusers_zimage_format(sd):
+                    if is_debug:
+                        print("[z-image] Diffusers format detected in tuple, converting...")
+                    return convert_zimage_diffusers_state_dict(sd), metadata
+                return result
+            
+            sd = result
+            if is_diffusers_zimage_format(sd):
+                if is_debug:
+                    print("[z-image] Diffusers format detected, converting...")
+                return convert_zimage_diffusers_state_dict(sd)
+            return sd
+        
+        comfy.utils.load_torch_file = patched_load_torch_file
+        
+        try:
+            model = load_diffusion_model(unet_path, model_options=model_options)
+        finally:
+            comfy.utils.load_torch_file = original_load_torch_file
+            
         end_time = time.time()
         
-        # Count layers for debugging
-        direct_load = 0
-        on_fly = 0
-        excluded = 0
+        if is_debug:
+            print(f"[DEBUG] Model load took: {end_time - start_time:.2f}s")
+            print(f"[DEBUG] Stats: {_loading_stats['int8_direct']} layers loaded directly, "
+                  f"{_loading_stats['quantized_on_fly']} quantized on-fly "
+                  f"({_loading_stats['quantize_time']:.2f}s), "
+                  f"{_loading_stats['excluded']} excluded")
         
-        for m in model.model.modules():
-            if hasattr(m, "_is_quantized"):
-                if m._is_quantized:
-                    # Check if it was loaded as int8 or converted
-                    # (This is a bit hacky since we don't track it explicitly in the layer,
-                    # but we can infer from the presence of weight_scale in buffers vs attributes)
-                    direct_load += 1
+        if is_debug:
+            print("\n" + "="*60)
+            print("[DEBUG] Detailed Model Inspection")
+            print("="*60)
+            
+            if hasattr(model, 'model'):
+                inner_model = model.model
+            else:
+                inner_model = model
+            
+            total_modules = 0
+            linear_modules = []
+            nan_scales = []
+            inf_scales = []
+            zero_scales = []
+            
+            for name, module in inner_model.named_modules():
+                total_modules += 1
+                if hasattr(module, 'weight'):
+                    if hasattr(module, '_is_quantized') and module._is_quantized:
+                        linear_modules.append((name, module))
+                        
+                        if hasattr(module, 'weight_scale'):
+                            scale = module.weight_scale
+                            if isinstance(scale, torch.Tensor):
+                                if torch.isnan(scale).any():
+                                    nan_scales.append((name, scale))
+                                if torch.isinf(scale).any():
+                                    inf_scales.append((name, scale))
+                                if (scale == 0).any():
+                                    zero_scales.append((name, scale))
+            
+            print(f"[DEBUG] Total modules: {total_modules}")
+            print(f"[DEBUG] INT8 quantized Linear layers: {len(linear_modules)}")
+            
+            if nan_scales:
+                print(f"\n[DEBUG] WARNING: {len(nan_scales)} layers have NaN scales:")
+                for name, scale in nan_scales[:10]:
+                    print(f"  - {name}: scale={scale}")
+                if len(nan_scales) > 10:
+                    print(f"  ... and {len(nan_scales) - 10} more")
+            
+            if inf_scales:
+                print(f"\n[DEBUG] WARNING: {len(inf_scales)} layers have Inf scales:")
+                for name, scale in inf_scales[:10]:
+                    print(f"  - {name}: scale={scale}")
+                if len(inf_scales) > 10:
+                    print(f"  ... and {len(inf_scales) - 10} more")
+            
+            if zero_scales:
+                print(f"\n[DEBUG] WARNING: {len(zero_scales)} layers have zero scales:")
+                for name, scale in zero_scales[:10]:
+                    print(f"  - {name}: scale={scale}")
+                if len(zero_scales) > 10:
+                    print(f"  ... and {len(zero_scales) - 10} more")
+            
+            print(f"\n[DEBUG] Sample INT8 layers:")
+            for name, module in linear_modules[:20]:
+                w_shape = tuple(module.weight.shape)
+                scale = getattr(module, 'weight_scale', 'N/A')
+                if isinstance(scale, torch.Tensor):
+                    scale_str = f"{scale.item():.6f}" if scale.numel() == 1 else f"tensor{tuple(scale.shape)}"
                 else:
-                    excluded += 1
-        
-        print(f"[DIAG] Model load took: {end_time - start_time:.2f}s")
-        print(f"[DIAG] Stats: {direct_load} layers loaded directly, {on_fly} quantized on-fly (0.00s), {excluded} excluded")
+                    scale_str = str(scale)
+                print(f"  {name}: weight={w_shape}, scale={scale_str}")
+            
+            print(f"\n[DEBUG] Weight value inspection:")
+            issues_found = []
+            for name, module in linear_modules:
+                weight = module.weight
+                if torch.isnan(weight).any():
+                    nan_count = torch.isnan(weight).sum().item()
+                    issues_found.append(f"{name}: {nan_count} NaN values in weight")
+                if torch.isinf(weight).any():
+                    inf_count = torch.isinf(weight).sum().item()
+                    issues_found.append(f"{name}: {inf_count} Inf values in weight")
+            
+            if issues_found:
+                print("[DEBUG] Weight issues found:")
+                for issue in issues_found[:10]:
+                    print(f"  - {issue}")
+                if len(issues_found) > 10:
+                    print(f"  ... and {len(issues_found) - 10} more")
+            else:
+                print("[DEBUG] No NaN/Inf values found in INT8 weights")
+            
+            print("="*60 + "\n")
         
         return (model,)

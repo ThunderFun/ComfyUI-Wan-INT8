@@ -1,5 +1,5 @@
 """
-int88 - Fast INT8 Tensorwise Quantization for ComfyUI
+int8 - Fast INT8 Tensorwise Quantization for ComfyUI
 
 Provides:
 - Int8TensorwiseOps: Custom operations for direct int8 weight loading
@@ -7,10 +7,6 @@ Provides:
 
 Uses torch._int_mm for blazing fast inference.
 """
-
-# torch.compile + INT8 compatibility fix
-# CUDA graphs are incompatible with cudaMallocAsync allocator.
-# We patch the problematic functions to work around this.
 
 import torch
 import os
@@ -21,8 +17,6 @@ def _apply_cudagraph_compatibility_fix():
     This allows torch.compile to work without requiring PYTORCH_ALLOC_CONF=backend:native.
     """
     
-    # === Patch torch._C._cuda_checkPoolLiveAllocations ===
-    # This is the C++ function that throws "cudaMallocAsync does not yet support checkPoolLiveAllocations"
     if hasattr(torch._C, '_cuda_checkPoolLiveAllocations'):
         _original_check = torch._C._cuda_checkPoolLiveAllocations
         def _safe_check(*args, **kwargs):
@@ -30,13 +24,10 @@ def _apply_cudagraph_compatibility_fix():
                 return _original_check(*args, **kwargs)
             except RuntimeError as e:
                 if "cudaMallocAsync" in str(e):
-                    # Return True to indicate "all allocations are accounted for"
-                    # This lets CUDA graphs proceed without the memory check
                     return True
                 raise
         torch._C._cuda_checkPoolLiveAllocations = _safe_check
     
-    # === Patch torch._C._cuda_memorySnapshot ===
     if hasattr(torch._C, '_cuda_memorySnapshot'):
         _original_snapshot = torch._C._cuda_memorySnapshot
         def _safe_snapshot(*args, **kwargs):
@@ -48,7 +39,6 @@ def _apply_cudagraph_compatibility_fix():
                 raise
         torch._C._cuda_memorySnapshot = _safe_snapshot
     
-    # === Patch torch._inductor.cudagraph_trees.check_memory_pool ===
     try:
         from torch._inductor import cudagraph_trees
         if hasattr(cudagraph_trees, 'check_memory_pool'):
@@ -58,7 +48,7 @@ def _apply_cudagraph_compatibility_fix():
                     return _original_check_pool(*args, **kwargs)
                 except RuntimeError as e:
                     if "cudaMallocAsync" in str(e):
-                        return None  # Skip the check
+                        return None
                     raise
             cudagraph_trees.check_memory_pool = _safe_check_pool
     except ImportError:
@@ -66,8 +56,6 @@ def _apply_cudagraph_compatibility_fix():
 
 _apply_cudagraph_compatibility_fix()
 
-# Register the int8_tensorwise format with ComfyUI's quant registry
-# This is for metadata compatibility when saving/loading models
 try:
     from comfy.quant_ops import QUANT_ALGOS, register_layout_class, QuantizedLayout
 
@@ -111,21 +99,38 @@ try:
 except ImportError:
     pass
 
-# Export the custom ops class for external use
 try:
-    from .int8_quant import Int8TensorwiseOps
+    from .int8_quant import (
+        Int8TensorwiseOps,
+        set_hadamard_quip_enabled,
+        is_hadamard_quip_enabled,
+        print_kernel_summary,
+        reset_kernel_stats,
+    )
+    
+    _hadamard_status = "enabled" if is_hadamard_quip_enabled() else "disabled"
+    print(f"[ComfyUI-Wan-INT8] Hadamard-QuIP kernel: {_hadamard_status}")
+    print(f"[ComfyUI-Wan-INT8] Use set_hadamard_quip_enabled(True/False) to toggle")
+    print(f"[ComfyUI-Wan-INT8] Use print_kernel_summary() to see inference kernel usage")
 except ImportError:
     Int8TensorwiseOps = None
+    set_hadamard_quip_enabled = None
+    is_hadamard_quip_enabled = None
+    print_kernel_summary = None
+    reset_kernel_stats = None
 
 from .int8_unet_loader import WanVideoINT8Loader
 from .wan_lora_loader import WanLoRALoader
+from .wan_lora_loader_with_clip import WanLoRALoaderWithCLIP
  
 NODE_CLASS_MAPPINGS = {
     "WanVideoINT8Loader": WanVideoINT8Loader,
-    "WanLoRALoader": WanLoRALoader,
+    "WanLoRALoaderINT8": WanLoRALoader,
+    "WanLoRALoaderWithCLIPINT8": WanLoRALoaderWithCLIP,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "WanVideoINT8Loader": "Wan Video INT8 Loader",
-    "WanLoRALoader": "Wan LoRA Loader (INT8)",
+    "WanVideoINT8Loader": "Wan Video Loader (INT8)",
+    "WanLoRALoaderINT8": "Wan LoRA Loader (INT8)",
+    "WanLoRALoaderWithCLIPINT8": "Wan LoRA Loader with CLIP (INT8)",
 }

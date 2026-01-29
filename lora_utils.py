@@ -56,6 +56,16 @@ WAN_LORA_KEY_MAP = {
     
     r"diffusion_model\.img_emb\.proj\.(\d+)": "diffusion_model.img_emb.proj.{i}",
 
+    # Wan 2.1 / 2.2 PEFT patterns
+    r"diffusion_model\.layers\.(\d+)\.attention\.to_q": "diffusion_model.layers.{i}.attention.to_q",
+    r"diffusion_model\.layers\.(\d+)\.attention\.to_k": "diffusion_model.layers.{i}.attention.to_k",
+    r"diffusion_model\.layers\.(\d+)\.attention\.to_v": "diffusion_model.layers.{i}.attention.to_v",
+    r"diffusion_model\.layers\.(\d+)\.attention\.to_out\.0": "diffusion_model.layers.{i}.attention.to_out.0",
+    r"diffusion_model\.layers\.(\d+)\.feed_forward\.w1": "diffusion_model.layers.{i}.feed_forward.w1",
+    r"diffusion_model\.layers\.(\d+)\.feed_forward\.w2": "diffusion_model.layers.{i}.feed_forward.w2",
+    r"diffusion_model\.layers\.(\d+)\.feed_forward\.w3": "diffusion_model.layers.{i}.feed_forward.w3",
+    r"diffusion_model\.layers\.(\d+)\.adaLN_modulation\.0": "diffusion_model.layers.{i}.adaLN_modulation.0",
+
     # Flux patterns (Kohya/X-Labs style)
     r"lora_unet_double_blocks_(\d+)_img_attn_qkv": "diffusion_model.double_blocks.{i}.img_attn.qkv",
     r"lora_unet_double_blocks_(\d+)_img_attn_proj": "diffusion_model.double_blocks.{i}.img_attn.proj",
@@ -117,9 +127,21 @@ class LoRAWeights:
     
     def get_for_layer(self, key: str, device: torch.device):
         if key not in self.weights:
-            return None, None, None
-        down, up, alpha = self.weights[key]
-        return down.to(device), up.to(device), alpha
+            return None
+        
+        w = self.weights[key]
+        if self.is_int8[key]:
+            # (down, up, down_scale, up_scale, alpha) - see add() method
+            return (
+                w[0].to(device),  # down
+                w[1].to(device),  # up
+                w[2].to(device) if isinstance(w[2], torch.Tensor) else w[2],  # down_scale
+                w[3].to(device) if isinstance(w[3], torch.Tensor) else w[3],  # up_scale
+                w[4]  # alpha
+            )
+        else:
+            # (down, up, alpha)
+            return (w[0].to(device), w[1].to(device), w[2])
 
 def detect_lora_format(state_dict):
     keys = list(state_dict.keys())
@@ -155,8 +177,13 @@ def parse_wan_lora(state_dict, strength=1.0, debug=False):
         for key in keys:
             if ".lora_down.weight" in key:
                 base_key = key.replace(".lora_down.weight", "")
-                down_weight = state_dict.pop(key)
-                up_weight = state_dict.pop(base_key + ".lora_up.weight")
+                down_weight = state_dict.pop(key, None)
+                up_weight = state_dict.pop(base_key + ".lora_up.weight", None)
+                
+                # Skip if either weight is missing
+                if down_weight is None or up_weight is None:
+                    continue
+                    
                 alpha = state_dict.pop(base_key + ".alpha", None)
                 
                 # Check for INT8 scales (pattern: .scale_weight)
@@ -194,6 +221,18 @@ def parse_wan_lora(state_dict, strength=1.0, debug=False):
                         model_key = model_key[len(prefix):]
                         break
                 
+                # Special handling for CLIP keys in PEFT
+                if "text_encoder" in model_key:
+                    # text_encoder.qwen3_4b.transformer.model.layers.0.self_attn.q_proj
+                    model_key = model_key.replace("text_encoder.", "")
+                elif "qwen3_4b" in model_key:
+                    # Handle cases where text_encoder prefix might have been stripped already
+                    pass
+                
+                # If it's a CLIP key, we should NOT apply UNet regex mappings later
+                is_clip_key = "qwen3_4b" in model_key or (".layers." in model_key and (".self_attn." in model_key or ".mlp." in model_key))
+                
+                
                 down_weight = state_dict.pop(key)
                 up_weight = state_dict.pop(lora_b_key)
                 
@@ -209,12 +248,26 @@ def parse_wan_lora(state_dict, strength=1.0, debug=False):
                 up_scale = state_dict.pop(base_key + ".lora_B.scale_weight",
                                          state_dict.pop(base_key + ".lora_B.default.scale_weight", None))
                 
+                if is_clip_key:
+                    # Try regex mapping for CLIP keys
+                    mapped_key = None
+                    for pattern, replacement in WAN_LORA_KEY_MAP.items():
+                        if "qwen3_4b" in replacement:
+                            match = re.match(pattern, model_key)
+                            if match:
+                                i = match.group(1)
+                                mapped_key = replacement.format(i=i)
+                                break
+                    if mapped_key:
+                        model_key = mapped_key
+
                 groups[model_key] = {
                     "down": down_weight,
                     "up": up_weight,
                     "alpha": alpha_value,
                     "down_scale": down_scale,
-                    "up_scale": up_scale
+                    "up_scale": up_scale,
+                    "is_clip": is_clip_key
                 }
     elif lora_format == "standard":
         # Standard format: diffusion_model.blocks.0.self_attn.to_q.down.weight
@@ -246,13 +299,20 @@ def parse_wan_lora(state_dict, strength=1.0, debug=False):
     for base_key, weights in groups.items():
         model_key = None
         
-        # Try regex mapping for Kohya-style keys
-        for pattern, replacement in WAN_LORA_KEY_MAP.items():
-            match = re.match(pattern, base_key)
-            if match:
-                i = match.group(1)
-                model_key = replacement.format(i=i)
-                break
+        # Skip regex mapping if already handled (e.g. PEFT CLIP)
+        if weights.get("is_clip", False):
+            model_key = base_key
+        else:
+            # Try regex mapping for Kohya-style keys
+            for pattern, replacement in WAN_LORA_KEY_MAP.items():
+                # Don't apply UNet mappings to CLIP keys
+                if "qwen3_4b" in replacement: continue
+                
+                match = re.match(pattern, base_key)
+                if match:
+                    i = match.group(1)
+                    model_key = replacement.format(i=i)
+                    break
         
         # If no regex match, assume the base_key is already the model key (PEFT/Standard)
         if not model_key:
