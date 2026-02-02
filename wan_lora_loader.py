@@ -1,211 +1,722 @@
 import os
+import copy
 import torch
 import torch.nn.functional as F
 import folder_paths
 import comfy.utils
 import gc
+import threading
+import hashlib
+import math
 from .lora_utils import parse_wan_lora
 
-# CUDA Synchronization control
-_ENABLE_CUDA_SYNC = os.environ.get("INT8_ENABLE_CUDA_SYNC", "0") == "1"
+_object_patches_lock = threading.RLock()
+
+_tensor_hash_lock = threading.Lock()
+
+def _parse_env_int(name, default):
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        print(f"Warning: Invalid value for {name}, using default: {default}")
+        return default
+
+def _parse_env_bool(name, default="0"):
+    val = os.environ.get(name, default)
+    return val == "1"
+
+_ENABLE_CUDA_SYNC = _parse_env_bool("INT8_ENABLE_CUDA_SYNC", "0")
 _CLEAR_CACHE_STRATEGY = os.environ.get("INT8_CLEAR_CACHE", "auto")
+_MAX_LORA_CACHE_SIZE = _parse_env_int("INT8_LORA_CACHE_SIZE", 32)
 
-# LoRA weight cache size limit (number of cached LoRA patches)
-_MAX_LORA_CACHE_SIZE = int(os.environ.get("INT8_LORA_CACHE_SIZE", "32"))
+_MAX_FULL_HASH_ELEMENTS = 64
 
+_HASH_SAMPLE_COUNT = 16
 
 def _should_clear_cache():
-    """Check if we should clear CUDA cache based on memory pressure."""
     if _CLEAR_CACHE_STRATEGY == "always":
         return True
     if _CLEAR_CACHE_STRATEGY == "never":
         return False
     if not torch.cuda.is_available():
         return False
-    allocated = torch.cuda.memory_allocated()
-    reserved = torch.cuda.memory_reserved()
-    if reserved > 0:
-        utilization = allocated / reserved
-                # This prevents unnecessary clearing when memory is actually being used
-        return utilization < 0.5
+    try:
+        allocated = torch.cuda.memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        if reserved > 0:
+            utilization = allocated / reserved
+            return utilization < 0.8
+        if allocated > 0:
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _get_tensor_content_hash(t, full_hash_threshold=1024*1024):
+    """Get a stable hash for tensor identity based on content."""
+    if not isinstance(t, torch.Tensor):
+        return (id(t),)
+
+    shape_str = str(t.shape)
+    dtype_str = str(t.dtype)
+    numel = t.numel()
+    
+    if numel == 0:
+        return (shape_str, dtype_str, 0)
+
+    if _ENABLE_CUDA_SYNC and torch.cuda.is_available() and t.is_cuda:
+        torch.cuda.synchronize(t.device)
+
+    with _tensor_hash_lock:
+        try:
+            flat = t.flatten().detach()
+            tensor_bytes = numel * t.element_size()
+            
+            if tensor_bytes <= full_hash_threshold:
+                cpu_tensor = flat.cpu()
+                content_bytes = cpu_tensor.numpy().tobytes()
+                content_hash = hashlib.sha256(content_bytes).hexdigest()
+                return (shape_str, dtype_str, numel, content_hash)
+            else:
+                num_samples = min(256, numel)
+                
+                bucket_size = numel // num_samples
+                indices = []
+                for i in range(num_samples):
+                    idx = i * bucket_size + bucket_size // 2
+                    indices.append(min(idx, numel - 1))
+                
+                indices.extend([0, numel - 1, numel // 2, numel // 4, 3 * numel // 4])
+                indices = sorted(set(indices))
+                
+                sample = flat[indices].cpu()
+                sample_bytes = sample.numpy().tobytes()
+                sample_hash = hashlib.sha256(sample_bytes).hexdigest()
+                
+                flat_f64 = flat.to(torch.float64)
+                tensor_sum = float(flat_f64.sum().item())
+                tensor_abs_sum = float(flat_f64.abs().sum().item())
+                tensor_min = float(flat_f64.min().item())
+                tensor_max = float(flat_f64.max().item())
+                
+                return (shape_str, dtype_str, numel, sample_hash,
+                        tensor_sum, tensor_abs_sum, tensor_min, tensor_max)
+                
+        except Exception as e:
+            return (shape_str, dtype_str, numel, id(t), "fallback", str(type(e).__name__))
+
+
+def _get_patch_identity(patches):
+    """Get a stable identity for patches list that avoids id() reuse issues."""
+    if not patches:
+        return ()
+    
+    try:
+        patches_snapshot = tuple(patches)
+    except (RuntimeError, TypeError):
+        import time
+        return ("unstable", id(patches), time.time())
+    
+    identities = []
+    for patch in patches_snapshot:
+        if isinstance(patch, (list, tuple)) and len(patch) >= 2:
+            d, u = patch[0], patch[1]
+            patch_id = (
+                _get_tensor_content_hash(d),
+                _get_tensor_content_hash(u),
+                len(patch)
+            )
+            if len(patch) >= 3:
+                alpha = patch[2]
+                if isinstance(alpha, (int, float)):
+                    patch_id = patch_id + (alpha,)
+                elif isinstance(alpha, torch.Tensor):
+                    patch_id = patch_id + (float(alpha.item()),)
+            identities.append(patch_id)
+        else:
+            identities.append((type(patch).__name__, id(patch)))
+    return tuple(identities)
+
+
+def _is_valid_alpha(a):
+    """Check if alpha value is valid (not None, NaN, or zero)."""
+    if a is None:
+        return False
+    
+    if isinstance(a, torch.Tensor):
+        if a.numel() == 0:
+            return False
+        try:
+            a_val = a.item()
+            return not (math.isnan(a_val) or a_val == 0)
+        except:
+            return False
+    
+    if isinstance(a, (int, float)):
+        return not (a != a or a == 0)
+    
     return False
 
-try:
-    from .int8_quant import Int8TensorwiseOps
-except ImportError:
-    Int8TensorwiseOps = None
+
+def _is_zero_alpha(a):
+    """Check if alpha is exactly zero (for warning suppression)."""
+    if a is None:
+        return False
+    
+    if isinstance(a, torch.Tensor):
+        try:
+            return a.item() == 0
+        except:
+            return False
+    
+    return a == 0
+
+
+def _identify_qkv_component(key: str) -> tuple:
+    """Identify which QKV component a LoRA key targets."""
+    key_lower = key.lower()
+    
+    fused_patterns = ['.qkv', '_qkv', '.to_qkv', '_to_qkv']
+    for pattern in fused_patterns:
+        if pattern in key_lower:
+            return (None, True)
+    
+    q_patterns = ['.to_q.', '.q_proj.', '_q.', '.q.', '_attn_q', '/q/']
+    k_patterns = ['.to_k.', '.k_proj.', '_k.', '.k.', '_attn_k', '/k/']
+    v_patterns = ['.to_v.', '.v_proj.', '_v.', '.v.', '_attn_v', '/v/']
+    
+    for pattern in q_patterns:
+        if pattern in key_lower or key_lower.endswith(pattern.rstrip('.')):
+            return ('q', False)
+    
+    for pattern in k_patterns:
+        if pattern in key_lower or key_lower.endswith(pattern.rstrip('.')):
+            return ('k', False)
+    
+    for pattern in v_patterns:
+        if pattern in key_lower or key_lower.endswith(pattern.rstrip('.')):
+            return ('v', False)
+    
+    return (None, False)
+
+
+def _validate_lora_bounds(offset, size, out_dim, key=""):
+    """Validate and adjust LoRA patch bounds to fit output tensor."""
+    if offset < 0:
+        print(f"Warning: Negative offset {offset} for {key}, clamping to 0")
+        offset = 0
+    
+    if size < 0:
+        print(f"Warning: Negative size {size} for {key}, treating as full size")
+        size = 0
+    
+    if size == 0:
+        size = out_dim - offset
+    
+    if offset >= out_dim:
+        print(f"Warning: Offset {offset} >= output dim {out_dim} for {key}, skipping")
+        return 0, 0, False
+    
+    if offset + size > out_dim:
+        old_size = size
+        size = out_dim - offset
+        print(f"Warning: Clamping size from {old_size} to {size} for {key}")
+    
+    if size <= 0:
+        return 0, 0, False
+    
+    return offset, size, True
+
 
 class LoRAWeightCache:
-    """LRU cache for LoRA weights with automatic cleanup."""
-    
+    """Thread-safe LRU cache for LoRA weights with reference counting."""
+
     def __init__(self, max_size=_MAX_LORA_CACHE_SIZE):
         self.max_size = max_size
         self._cache = {}
         self._access_order = []
-    
+        self._lock = threading.RLock()
+        self._ref_counts = {}
+
     def get(self, key):
-        if key in self._cache:
-            # Move to end (most recently used)
-            if key in self._access_order:
-                self._access_order.remove(key)
-            self._access_order.append(key)
-            return self._cache[key]
-        return None
-    
-    def set(self, key, value):
-        if key in self._cache:
-            # Update existing
-            self._cache[key] = value
-            if key in self._access_order:
-                self._access_order.remove(key)
-            self._access_order.append(key)
-        else:
-            # Evict oldest if at capacity
+        """Get cached value. Returns a deep copy of tensor values."""
+        with self._lock:
+            if key in self._cache:
+                try:
+                    self._access_order.remove(key)
+                except ValueError:
+                    pass
+                self._access_order.append(key)
+                self._ref_counts[key] = self._ref_counts.get(key, 0) + 1
+                value = self._cache[key]
+                if isinstance(value, dict):
+                    result = {}
+                    for k, v in value.items():
+                        if isinstance(v, torch.Tensor):
+                            result[k] = v.detach().clone().contiguous()
+                        else:
+                            result[k] = v
+                    return result
+                elif isinstance(value, torch.Tensor):
+                    return value.detach().clone().contiguous()
+                return value
+            return None
+
+    def get_or_create(self, key, factory_fn):
+        """Atomically get existing value or create and cache new one."""
+        with self._lock:
+            if key in self._cache:
+                try:
+                    self._access_order.remove(key)
+                except ValueError:
+                    pass
+                self._access_order.append(key)
+                self._ref_counts[key] = self._ref_counts.get(key, 0) + 1
+                
+                value = self._cache[key]
+                if isinstance(value, dict):
+                    result = {}
+                    for k, v in value.items():
+                        if isinstance(v, torch.Tensor):
+                            result[k] = v.detach().clone().contiguous()
+                        else:
+                            result[k] = v
+                    return (result, False)
+                elif isinstance(value, torch.Tensor):
+                    return (value.detach().clone().contiguous(), False)
+                return (value, False)
+            
             if len(self._cache) >= self.max_size:
                 self._evict_oldest()
+            
+            value = factory_fn()
+            
             self._cache[key] = value
             self._access_order.append(key)
-    
+            self._ref_counts[key] = 1
+            
+            if isinstance(value, dict):
+                result = {}
+                for k, v in value.items():
+                    if isinstance(v, torch.Tensor):
+                        result[k] = v.detach().clone().contiguous()
+                    else:
+                        result[k] = v
+                return (result, True)
+            elif isinstance(value, torch.Tensor):
+                return (value.detach().clone().contiguous(), True)
+            return (value, True)
+
+    def release(self, key):
+        """Release a reference obtained via get()."""
+        with self._lock:
+            if key in self._ref_counts:
+                self._ref_counts[key] -= 1
+                if self._ref_counts[key] <= 0:
+                    del self._ref_counts[key]
+
+    def set(self, key, value, initial_ref_count=0):
+        """Set cached value with optional initial reference count."""
+        with self._lock:
+            if key in self._cache:
+                self._cache[key] = value
+                try:
+                    self._access_order.remove(key)
+                except ValueError:
+                    pass
+                self._access_order.append(key)
+                if initial_ref_count > 0:
+                    self._ref_counts[key] = self._ref_counts.get(key, 0) + initial_ref_count
+            else:
+                if len(self._cache) >= self.max_size:
+                    self._evict_oldest()
+                self._cache[key] = value
+                self._access_order.append(key)
+                if initial_ref_count > 0:
+                    self._ref_counts[key] = initial_ref_count
+
     def _evict_oldest(self):
-        if self._access_order:
-            oldest = self._access_order.pop(0)
-            if oldest in self._cache:
-                del self._cache[oldest]
-    
+        """Evict oldest entry with zero reference count."""
+        evicted = False
+        for i, key in enumerate(list(self._access_order)):
+            if self._ref_counts.get(key, 0) == 0:
+                self._access_order.remove(key)
+                if key in self._cache:
+                    self._cache.pop(key)
+                evicted = True
+                break
+        
+        if not evicted and len(self._cache) >= self.max_size:
+            import warnings
+            warnings.warn(
+                f"LoRA weight cache at capacity ({self.max_size}) with all entries in use. "
+                "Consider increasing INT8_LORA_CACHE_SIZE environment variable.",
+                ResourceWarning,
+                stacklevel=3
+            )
+
+    def _release_value(self, value):
+        """Release value references when evicting from cache."""
+        pass
+
     def clear(self):
-        """Clear all cached weights and free memory."""
-        self._cache.clear()
-        self._access_order.clear()
-    
-    def __len__(self):
-        return len(self._cache)
+        """Clear cache entries with zero reference count."""
+        with self._lock:
+            keys_to_evict = []
+            for key in self._access_order:
+                if self._ref_counts.get(key, 0) == 0:
+                    keys_to_evict.append(key)
+            
+            for key in keys_to_evict:
+                if key in self._cache:
+                    value = self._cache.pop(key)
+                    self._release_value(value)
+                try:
+                    self._access_order.remove(key)
+                except ValueError:
+                    pass
+                self._ref_counts.pop(key, None)
 
 
-def make_patched_forward(mod, orig_fwd):
-    # Attach cache to module for external access and cleanup
-    if not hasattr(mod, '_lora_weight_cache'):
-        mod._lora_weight_cache = LoRAWeightCache(_MAX_LORA_CACHE_SIZE)
+class LoRAWrapperModule(torch.nn.Module):
+    def __init__(self, wrapped_module, lora_patches_list):
+        super().__init__()
+        if lora_patches_list is not None and not isinstance(lora_patches_list, (list, tuple)):
+            raise TypeError(f"lora_patches_list must be a list or tuple, got {type(lora_patches_list).__name__}")
+        
+        self._getting_attr = threading.local()
+        self._getattr_lock = threading.Lock()
+        
+        # Store as a submodule so PyTorch can find it
+        self._wrapped_module = wrapped_module
+        self.lora_patches = lora_patches_list if lora_patches_list is not None else []
+        self._lora_weight_cache = LoRAWeightCache(_MAX_LORA_CACHE_SIZE)
+        self._last_patch_ids = None
+        self._patch_ids_lock = threading.Lock()
+
+    def __setstate__(self, state):
+        """Restore object state from pickle, handling backwards compatibility."""
+        # Handle old pickles that have 'wrapped_module' instead of '_wrapped_module'
+        if 'wrapped_module' in state and '_wrapped_module' not in state:
+            state['_wrapped_module'] = state.pop('wrapped_module')
+        # Handle case where neither exists (shouldn't happen, but be safe)
+        if '_wrapped_module' not in state:
+            state['_wrapped_module'] = None
+        # Restore threading locals and locks (can't be pickled)
+        state['_getting_attr'] = threading.local()
+        state['_getattr_lock'] = threading.Lock()
+        state['_patch_ids_lock'] = threading.Lock()
+        # Restore the cache
+        state['_lora_weight_cache'] = LoRAWeightCache(_MAX_LORA_CACHE_SIZE)
+        self.__dict__.update(state)
+
+    @property
+    def wrapped_module(self):
+        # Backwards compatibility: check both old and new attribute names
+        if '_wrapped_module' in self.__dict__:
+            return self.__dict__['_wrapped_module']
+        if 'wrapped_module' in self.__dict__:
+            return self.__dict__['wrapped_module']
+        raise AttributeError("wrapped_module not set")
     
-    def patched_forward(x):
-        out = orig_fwd(x)
-        patches = getattr(mod, "lora_patches", [])
-        if patches:
-            # Clear cache if patches have changed (different LoRA loaded)
-            def patch_hash(p):
-                """Create a hash based on patch tensor shapes and dtypes, not memory address."""
-                d, u = p[0], p[1]
-                return hash((d.shape, d.dtype, u.shape, u.dtype, id(p)))  # id(p) as fallback entropy
+    @wrapped_module.setter
+    def wrapped_module(self, value):
+        self._wrapped_module = value
+
+    @property
+    def weight(self):
+        """Expose weight directly for ComfyUI compatibility."""
+        wrapped = self.wrapped_module  # Use property for backwards compatibility
+        if wrapped is not None and hasattr(wrapped, 'weight'):
+            return wrapped.weight
+        raise AttributeError("wrapped module has no weight")
+
+    @property
+    def bias(self):
+        """Expose bias directly for ComfyUI compatibility."""
+        wrapped = self.wrapped_module  # Use property for backwards compatibility
+        if wrapped is not None and hasattr(wrapped, 'bias'):
+            return wrapped.bias
+        return None
+
+    def __deepcopy__(self, memo):
+        """Custom deepcopy that handles threading.local() and locks."""
+        new_instance = self.__class__.__new__(self.__class__)
+        memo[id(self)] = new_instance
+        
+        # Use property for backwards compatibility with old objects
+        wrapped = self.wrapped_module
+        if wrapped is not None:
+            new_instance._wrapped_module = copy.deepcopy(wrapped, memo)
+        else:
+            new_instance._wrapped_module = None
+        
+        new_instance.lora_patches = copy.deepcopy(self.lora_patches, memo)
+        
+        new_instance._getting_attr = threading.local()
+        new_instance._getattr_lock = threading.Lock()
+        new_instance._patch_ids_lock = threading.Lock()
+        
+        new_instance._lora_weight_cache = LoRAWeightCache(_MAX_LORA_CACHE_SIZE)
+        new_instance._last_patch_ids = self._last_patch_ids
+        
+        return new_instance
+
+    def _is_getting_attr(self, name):
+        """Check if we're already getting this attribute (per-thread)."""
+        try:
+            return name in self._getting_attr.set
+        except AttributeError:
+            return False
+
+    def _add_getting_attr(self, name):
+        """Add to getting_attr set (per-thread)."""
+        try:
+            self._getting_attr.set.add(name)
+        except AttributeError:
+            self._getting_attr.set = {name}
+
+    def _remove_getting_attr(self, name):
+        """Remove from getting_attr set (per-thread)."""
+        try:
+            self._getting_attr.set.discard(name)
+        except AttributeError:
+            pass
+
+    def __getattr__(self, name):
+        # Handle access to wrapped_module attributes when they don't exist (backwards compatibility)
+        if name in ('_wrapped_module', 'wrapped_module'):
+            # Check all possible locations
+            if '_wrapped_module' in self.__dict__:
+                return self.__dict__['_wrapped_module']
+            if 'wrapped_module' in self.__dict__:
+                return self.__dict__['wrapped_module']
+            # Check if stored as a submodule by PyTorch
+            if '_modules' in self.__dict__:
+                if 'wrapped_module' in self._modules:
+                    return self._modules['wrapped_module']
+                if '_wrapped_module' in self._modules:
+                    return self._modules['_wrapped_module']
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        
+        # Check if we have _getting_attr initialized
+        try:
+            getting_attr = object.__getattribute__(self, '_getting_attr')
+        except AttributeError:
+            # Fallback during initialization
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        
+        if self._is_getting_attr(name):
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}' (recursion detected)")
+        
+        self._add_getting_attr(name)
+        try:
+            # Try to get from wrapped module (check both old and new attribute names)
+            wrapped = None
+            if '_wrapped_module' in self.__dict__:
+                wrapped = self.__dict__['_wrapped_module']
+            elif 'wrapped_module' in self.__dict__:
+                wrapped = self.__dict__['wrapped_module']
             
-            current_patch_ids = tuple(patch_hash(p) for p in patches)
-            last_patch_ids = getattr(mod, '_last_patch_ids', None)
-            if last_patch_ids is not None and last_patch_ids != current_patch_ids:
-                # Patches changed - clear the cache to prevent memory leak
-                mod._lora_weight_cache.clear()
-            mod._last_patch_ids = current_patch_ids
+            if wrapped is not None:
+                return getattr(wrapped, name)
             
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        finally:
+            self._remove_getting_attr(name)
+
+    def __delattr__(self, name):
+        """Safe attribute deletion with protected attributes."""
+        _protected_attrs = {'_getting_attr', '_getattr_lock', '_patch_ids_lock',
+                            '_wrapped_module', 'lora_patches', '_lora_weight_cache'}
+        
+        if name in _protected_attrs:
+            raise AttributeError(f"Cannot delete protected attribute '{name}'")
+        
+        if name in self.__dict__:
+            object.__delattr__(self, name)
+            return
+        
+        if name in self._modules:
+            del self._modules[name]
+            return
+        if name in self._parameters:
+            del self._parameters[name]
+            return
+        if name in self._buffers:
+            del self._buffers[name]
+            return
+        
+        # Use property for backwards compatibility
+        try:
+            wrapped = self.wrapped_module
+        except AttributeError:
+            wrapped = None
+        if wrapped is not None:
+            try:
+                delattr(wrapped, name)
+                return
+            except AttributeError:
+                pass
+        
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+    def forward(self, x):
+        # Use property for backwards compatibility with old objects
+        wrapped = self.wrapped_module
+        original_out = wrapped(x)
+        
+        patches = self.lora_patches
+        if not patches:
+            return original_out
+
+        try:
+            from .int8_quant import chunked_int8_lora_forward, chunked_lora_forward, CHUNK_THRESHOLD_ELEMENTS
+        except ImportError as e:
+            print(f"ERROR: Failed to import int8_quant module: {e}. LoRA will not be applied.")
+            return original_out
+
+        with self._patch_ids_lock:
+            current_patch_ids = _get_patch_identity(patches)
+            if self._last_patch_ids != current_patch_ids:
+                self._lora_weight_cache.clear()
+            self._last_patch_ids = current_patch_ids
+
+        x_shape = x.shape
+        x_2d = x.reshape(-1, x_shape[-1])
+        if not x_2d.is_contiguous():
+            x_2d = x_2d.contiguous()
+
+        out = None
+        keys_to_release = set()
+        any_patch_applied = False
+        
+        try:
             for patch_data in patches:
-                # Unpack patch data (supports both old and new format)
-                if len(patch_data) == 3:
-                    # Old format: (down, up, alpha)
+                if not isinstance(patch_data, (list, tuple)):
+                    print(f"Warning: Invalid patch_data type: {type(patch_data)}")
+                    continue
+
+                patch_len = len(patch_data)
+                if patch_len == 3:
                     d, u, a = patch_data
                     d_scale, u_scale = None, None
                     offset, size = 0, 0
-                elif len(patch_data) == 5:
-                    # New format: (down, up, alpha, down_scale, up_scale)
+                elif patch_len == 5:
                     d, u, a, d_scale, u_scale = patch_data
                     offset, size = 0, 0
-                else:
-                    # Extended format: (down, up, alpha, down_scale, up_scale, offset, size)
+                elif patch_len == 7:
                     d, u, a, d_scale, u_scale, offset, size = patch_data
-                
-                # Check if this is INT8 LoRA
-                is_int8 = d.dtype == torch.int8 and u.dtype == torch.int8
-                
-                if is_int8 and d_scale is not None and u_scale is not None:
-                    # INT8 LoRA path using torch._int_mm
-                    from .int8_quant import chunked_int8_lora_forward, CHUNK_THRESHOLD_ELEMENTS
-                    
-                    # Flatten x to 2D for matmul
-                    x_shape = x.shape
-                    x_2d = x.reshape(-1, x_shape[-1])
-                    
-                                        # Use hash of full tensor bytes for small tensors, sampled hash + checksum for large
-                    def tensor_content_hash(t):
-                        """Create a strong hash based on tensor content."""
-                        if t.numel() == 0:
-                            return 0
-                        
-                        # For small tensors, hash the full content
-                        if t.numel() <= 1024:
-                            return hash((t.tobytes(), t.shape, t.dtype, t.device.index if t.device.type == 'cuda' else -1))
-                        
-                        # For large tensors, use multiple samples + statistical summary
-                        flat = t.flatten()
-                        n = flat.numel()
-                        
-                        # Sample at multiple points with denser sampling at boundaries
-                        sample_indices = [
-                            0, 1, 2,  # Start
-                            n // 8, n // 4, n // 2, 3 * n // 4, 7 * n // 8,  # Middle regions
-                            n - 3, n - 2, n - 1  # End
-                        ]
-                        sample_indices = list(dict.fromkeys(i for i in sample_indices if 0 <= i < n))  # Unique valid indices
-                        samples = flat[sample_indices].tolist()
-                        
-                        # Add statistical summary to detect distribution changes
-                        mean_val = flat.mean().item()
-                        std_val = flat.std().item()
-                        
-                        return hash((tuple(samples), mean_val, std_val, t.shape, t.dtype, t.device.index if t.device.type == 'cuda' else -1))
-                    
-                    cache_key = (d.shape, d.dtype, u.shape, u.dtype, tensor_content_hash(d), tensor_content_hash(u))
-                    
-                    cached = mod._lora_weight_cache.get(cache_key)
-                    if cached is None:
-                        # First time - move to GPU and cache
-                        cached = {
-                            'd': d.to(device=out.device, non_blocking=True),
-                            'u': u.to(device=out.device, non_blocking=True),
-                            'd_scale': d_scale.to(device=out.device, non_blocking=True) if isinstance(d_scale, torch.Tensor) else d_scale,
-                            'u_scale': u_scale.to(device=out.device, non_blocking=True) if isinstance(u_scale, torch.Tensor) else u_scale,
-                        }
-                        mod._lora_weight_cache.set(cache_key, cached)
-                    
-                    # Use cached weights
-                    chunked_int8_lora_forward(
-                        x_2d, cached['d'], cached['u'], 
-                        cached['d_scale'], cached['u_scale'], 
-                        a, out,
-                        offset=offset, size=size
-                    )
-                    
-                    # Clear cache based on memory pressure strategy
-                    if out.numel() > CHUNK_THRESHOLD_ELEMENTS and _should_clear_cache():
-                        mod._lora_weight_cache.clear()
-                        torch.cuda.empty_cache()
-                    
-                    del x_2d
                 else:
-                    # Float LoRA path
-                    from .int8_quant import chunked_lora_forward
-                    
-                    # Flatten x to 2D for matmul (consistent with INT8 path)
-                    x_shape = x.shape
-                    x_2d = x.reshape(-1, x_shape[-1])
-                    
-                    # Ensure x matches output dtype for LoRA math
-                    if x_2d.dtype != out.dtype:
-                        x_2d = x_2d.to(dtype=out.dtype)
-                    
-                    d_t = d.to(device=out.device, dtype=out.dtype)
-                    u_t = u.to(device=out.device, dtype=out.dtype)
-                    
-                    # Use memory-efficient chunked forward
-                    chunked_lora_forward(x_2d, d_t, u_t, a, out, offset=offset, size=size)
-                    
-                    del d_t, u_t, x_2d
-        return out
-    return patched_forward
+                    print(f"Warning: Unexpected patch_data length: {patch_len}")
+                    continue
+
+                if not all(isinstance(t, torch.Tensor) for t in [d, u]):
+                    print(f"Warning: Expected d and u to be tensors")
+                    continue
+
+                if not _is_valid_alpha(a):
+                    if not _is_zero_alpha(a):
+                        print(f"Warning: Invalid alpha value ({a}), skipping patch")
+                    continue
+
+                is_int8 = d.dtype == torch.int8 and u.dtype == torch.int8
+                expected_input_dim = d.shape[1]
+                
+                if expected_input_dim != x_2d.shape[-1]:
+                    print(f"Warning: Shape mismatch: d.shape={d.shape}, x_2d.shape={x_2d.shape}")
+                    continue
+
+                offset, size, is_valid = _validate_lora_bounds(
+                    offset, size, original_out.shape[-1],
+                    key=f"patch_{id(patch_data)}"
+                )
+                if not is_valid:
+                    continue
+
+                # KEY FIX: Lazy clone - only clone when we have a valid patch to apply
+                if out is None:
+                    # Check if we can modify in-place (no gradient required)
+                    if not original_out.requires_grad and original_out.is_contiguous():
+                        out = original_out  # Use directly, no clone
+                    else:
+                        out = original_out.clone()
+                
+                try:
+                    if is_int8 and d_scale is not None and u_scale is not None:
+                        cache_key = (
+                            "int8",
+                            _get_tensor_content_hash(d), _get_tensor_content_hash(u),
+                            _get_tensor_content_hash(d_scale), _get_tensor_content_hash(u_scale),
+                            offset, size, original_out.shape[-1],
+                        )
+                        
+                        def create_int8_cache():
+                            return {
+                                'd': d.to(device=original_out.device, non_blocking=False),
+                                'u': u.to(device=original_out.device, non_blocking=False),
+                                'd_scale': d_scale.to(device=original_out.device, non_blocking=False) if isinstance(d_scale, torch.Tensor) else d_scale,
+                                'u_scale': u_scale.to(device=original_out.device, non_blocking=False) if isinstance(u_scale, torch.Tensor) else u_scale,
+                            }
+
+                        cached, _ = self._lora_weight_cache.get_or_create(cache_key, create_int8_cache)
+                        keys_to_release.add(cache_key)
+
+                        chunked_int8_lora_forward(
+                            x_2d, cached['d'], cached['u'],
+                            cached['d_scale'], cached['u_scale'],
+                            a, out, offset=offset, size=size
+                        )
+                        any_patch_applied = True
+                    else:
+                        curr_x = x_2d.to(dtype=original_out.dtype) if x_2d.dtype != original_out.dtype else x_2d
+
+                        cache_key = (
+                            "float",
+                            _get_tensor_content_hash(d), _get_tensor_content_hash(u),
+                            original_out.dtype, offset, size, original_out.shape[-1],
+                        )
+
+                        def create_float_cache():
+                            return {
+                                'd': d.to(device=original_out.device, dtype=original_out.dtype, non_blocking=False),
+                                'u': u.to(device=original_out.device, dtype=original_out.dtype, non_blocking=False),
+                            }
+
+                        cached, _ = self._lora_weight_cache.get_or_create(cache_key, create_float_cache)
+                        keys_to_release.add(cache_key)
+
+                        chunked_lora_forward(
+                            curr_x, cached['d'], cached['u'],
+                            a, out, offset=offset, size=size
+                        )
+                        any_patch_applied = True
+                
+                except Exception as e:
+                    print(f"Error computing LoRA patch contribution: {e}")
+                    continue
+
+            # KEY FIX: Return appropriate tensor without keeping extra references
+            if out is not None and any_patch_applied:
+                if out is original_out:
+                    return out
+                else:
+                    # Delete original to free memory before returning
+                    del original_out
+                    return out
+            else:
+                if out is not None and out is not original_out:
+                    del out
+                return original_out
+
+        finally:
+            for key in keys_to_release:
+                try:
+                    self._lora_weight_cache.release(key)
+                except Exception:
+                    pass
+
 
 class WanLoRALoader:
     @classmethod
@@ -214,23 +725,23 @@ class WanLoRALoader:
             "required": {
                 "model": ("MODEL",),
                 "lora_name": (folder_paths.get_filename_list("loras"),),
-                "strength": ("FLOAT", {"default": 1.0, "min": -2.0, "max": 2.0, "step": 0.01}),
+                "strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
                 "offload_to_cpu": (["enable", "disable"], {"default": "disable"}),
             },
             "optional": {
                 "debug": ("BOOLEAN", {"default": False}),
             }
         }
-    
+
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load_lora"
     CATEGORY = "WanVideo/INT8"
-    
+
     def load_lora(self, model, lora_name, strength, offload_to_cpu="disable", debug=False):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            
+
         if strength == 0:
             return (model,)
 
@@ -240,241 +751,224 @@ class WanLoRALoader:
             return (model,)
 
         print(f"Loading LoRA: {lora_name}")
-        
-        # Determine if we should offload float LoRAs to CPU
         offload_enabled = (offload_to_cpu == "enable")
-        
-        lora_state_dict = comfy.utils.load_torch_file(lora_path)
 
-        # Parse LoRA weights and map to model keys
-        lora_weights = parse_wan_lora(lora_state_dict, strength, debug=debug)
+        lora_state_dict = None
+        lora_weights = None
+        modules = None
         
-        # Clear state dict immediately to save memory
-        del lora_state_dict
-        gc.collect()
-        
-        # Clone model to avoid mutating the original patcher
-        new_model = model.clone()
-        
-        # Get the underlying torch model
-        # In ComfyUI, model.model is the BaseModel
-        torch_model = new_model.model
-        
-        # Map of module name -> module
-        modules = dict(torch_model.named_modules())
-        
-        if debug:
-            print(f"\n[DEBUG] Available model modules ({len(modules)}):")
-            linear_modules = [k for k, v in modules.items() if isinstance(v, torch.nn.Linear)]
-            print(f"[DEBUG] Linear modules: {len(linear_modules)}")
-            for i, key in enumerate(sorted(linear_modules)[:20]):  # Show first 20 Linear modules
-                mod = modules[key]
-                print(f"  {i+1}. {key} ({mod.weight.shape[0]}x{mod.weight.shape[1]})")
-            if len(linear_modules) > 20:
-                print(f"  ... and {len(linear_modules) - 20} more Linear modules")
-        
-        patched_count = 0
-        failed_count = 0
-        
-        failed_keys = []  # Track which keys failed
-        dim_mismatch_count = 0
-        
-        for key in lora_weights.weights:
-            target_module = None
-            target_key = None
+        try:
+            lora_state_dict = comfy.utils.load_torch_file(lora_path)
+            lora_weights = parse_wan_lora(lora_state_dict, strength, debug=debug)
             
-            if debug:
-                print(f"\n[DEBUG] Processing LoRA key: {key}")
+            if lora_state_dict is not None:
+                del lora_state_dict
+                lora_state_dict = None
+            gc.collect()
+
+            if lora_weights is None:
+                print(f"Failed to parse LoRA: {lora_name}")
+                return (model,)
+
+            new_model = model.clone()
             
-            # Generate candidate keys
-            candidates = [key]
-            
-            # 1. Prefix variations
-            if key.startswith("diffusion_model."):
-                candidates.append(key[len("diffusion_model."):])
-            else:
-                candidates.append("diffusion_model." + key)
-            
-            # 2. Attn variations
-            new_candidates = []
-            for c in candidates:
-                if ".self_attn." in c:
-                    new_candidates.append(c.replace(".self_attn.", ".attn."))
-                elif ".attn." in c:
-                    new_candidates.append(c.replace(".attn.", ".self_attn."))
-            candidates.extend(new_candidates)
-            
-            # 3. to_out variations
-            new_candidates = []
-            for c in candidates:
-                if ".to_out.0" in c:
-                    new_candidates.append(c.replace(".to_out.0", ".to_out"))
-                elif ".to_out" in c and ".to_out.0" not in c:
-                    new_candidates.append(c.replace(".to_out", ".to_out.0"))
-            candidates.extend(new_candidates)
-            
-            # 4. q/k/v/o variations
-            new_candidates = []
-            replacements = [
-                # Single projection mappings
-                (".to_q", ".q"), (".to_k", ".k"), (".to_v", ".v"), (".to_out", ".o"),
-                (".q", ".to_q"), (".k", ".to_k"), (".v", ".to_v"), (".o", ".to_out"),
-                # Fused QKV mappings
-                (".to_q", ".qkv"), (".to_k", ".qkv"), (".to_v", ".qkv"),
-                (".q_proj", ".qkv"), (".k_proj", ".qkv"), (".v_proj", ".qkv"),
-                # Output mappings
-                (".to_out.0", ".out"), (".to_out", ".out"),
-            ]
-            for c in candidates:
-                for old, new in replacements:
-                    if old in c:
-                        new_candidates.append(c.replace(old, new))
-            candidates.extend(new_candidates)
-            
-            if debug:
-                print(f"[DEBUG] Generated {len(candidates)} candidates")
-            
-            # 5. Remove duplicates and try matching
-            patch_offset = 0
-            patch_size = 0
-            
-            seen = set()
-            for cand in candidates:
-                if cand in seen: continue
-                seen.add(cand)
-                if cand in modules:
-                    target_module = modules[cand]
-                    target_key = cand
+            with _object_patches_lock:
+                if not hasattr(new_model, "object_patches"):
+                    new_model.object_patches = {}
+                else:
+                    original_patches = new_model.object_patches
+                    new_object_patches = {}
                     
-                    # Handle fused QKV mapping
-                    if ".qkv" in cand:
-                        if ".to_q" in key or ".q_proj" in key or "_attn_q" in key:
-                            patch_size = target_module.weight.shape[0] // 3
-                            patch_offset = 0
-                        elif ".to_k" in key or ".k_proj" in key or "_attn_k" in key:
-                            patch_size = target_module.weight.shape[0] // 3
-                            patch_offset = patch_size
-                        elif ".to_v" in key or ".v_proj" in key or "_attn_v" in key:
-                            patch_size = target_module.weight.shape[0] // 3
-                            patch_offset = patch_size * 2
+                    for key, value in list(original_patches.items()):
+                        if isinstance(value, LoRAWrapperModule):
+                            value._lora_weight_cache.clear()
+                        try:
+                            new_object_patches[key] = copy.deepcopy(value)
+                        except Exception as e:
+                            print(f"Warning: Failed to deepcopy patch {key}: {e}")
+                            new_object_patches[key] = value
                     
-                    if debug:
-                        print(f"[DEBUG] ✓ Matched to model key: {target_key} (offset={patch_offset}, size={patch_size})")
-                    break
+                    new_model.object_patches = new_object_patches
 
-            if target_module is not None:
-                # If module doesn't have lora_patches, try to add it and patch forward
-                if not hasattr(target_module, "lora_patches"):
-                    if isinstance(target_module, torch.nn.Linear):
-                        target_module.lora_patches = []
-                        
-                        # Patch forward method to support lora_patches
-                        original_forward = target_module.forward
-                        target_module.forward = make_patched_forward(target_module, original_forward)
+            torch_model = new_model.model
+            modules = dict(torch_model.named_modules())
 
-                if hasattr(target_module, "lora_patches"):
-                    # Check if this is INT8 LoRA
+            patched_count = 0
+            
+            patches_to_apply = []
+
+            for key in lora_weights.weights:
+                target_module = None
+                target_key = None
+
+                candidates = [key]
+                
+                if key.startswith("diffusion_model."):
+                    candidates.append(key[len("diffusion_model."):])
+                else:
+                    candidates.append("diffusion_model." + key)
+
+                var_candidates = []
+                for c in candidates:
+                    if ".self_attn." in c:
+                        var_candidates.append(c.replace(".self_attn.", ".attn."))
+                    elif ".attn." in c:
+                        var_candidates.append(c.replace(".attn.", ".self_attn."))
+                    if ".to_out.0" in c:
+                        var_candidates.append(c.replace(".to_out.0", ".to_out"))
+                    elif ".to_out" in c and ".to_out.0" not in c:
+                        var_candidates.append(c.replace(".to_out", ".to_out.0"))
+
+                candidates = candidates + var_candidates
+
+                replacements = [
+                    (".to_q", ".q"), (".to_k", ".k"), (".to_v", ".v"), (".to_out", ".o"),
+                    (".q_proj", ".qkv"), (".k_proj", ".qkv"), (".v_proj", ".qkv"),
+                    (".to_q", ".qkv"), (".to_k", ".qkv"), (".to_v", ".qkv")
+                ]
+
+                final_pass_candidates = list(candidates)
+                for c in candidates:
+                    for old, new in replacements:
+                        if old in c:
+                            final_pass_candidates.append(c.replace(old, new))
+
+                candidates = final_pass_candidates
+
+                patch_offset = 0
+                patch_size = 0
+
+                for cand in candidates:
+                    if cand in modules:
+                        target_module = modules[cand]
+                        target_key = cand
+
+                        if ".qkv" in cand and isinstance(target_module, torch.nn.Linear):
+                            total_out = target_module.weight.shape[0]
+                            
+                            if total_out % 3 != 0:
+                                print(f"Warning: Cannot apply LoRA to QKV module {cand}: "
+                                      f"output dimension {total_out} is not divisible by 3. "
+                                      f"This LoRA patch will be skipped for key: {key}")
+                                target_module = None
+                                target_key = None
+                                break
+                            
+                            head_dim = total_out // 3
+                            
+                            is_int8 = lora_weights.is_int8.get(key, False)
+                            if is_int8:
+                                down, up, down_scale, up_scale, alpha = lora_weights.weights[key]
+                            else:
+                                down, up, alpha = lora_weights.weights[key]
+                            
+                            lora_out_dim = up.shape[0] if up is not None and hasattr(up, 'shape') else 0
+                            
+                            if lora_out_dim == total_out:
+                                patch_offset = 0
+                                patch_size = 0
+                                if debug:
+                                    print(f"Full QKV LoRA detected for {key}: out_dim={lora_out_dim}")
+                            elif lora_out_dim == head_dim:
+                                component, is_fused = _identify_qkv_component(key)
+                                
+                                if component == 'q':
+                                    patch_offset = 0
+                                    patch_size = head_dim
+                                elif component == 'k':
+                                    patch_offset = head_dim
+                                    patch_size = head_dim
+                                elif component == 'v':
+                                    patch_offset = head_dim * 2
+                                    patch_size = head_dim
+                                else:
+                                    print(f"Warning: Could not determine Q/K/V type for partial LoRA key: {key}")
+                                    target_module = None
+                                    target_key = None
+                            elif lora_out_dim > 0:
+                                print(f"Warning: LoRA output dimension {lora_out_dim} doesn't match "
+                                      f"expected full QKV ({total_out}) or single head ({head_dim}) for {key}")
+                                target_module = None
+                                target_key = None
+                            break
+
+                if target_module is not None and isinstance(target_module, torch.nn.Linear):
                     is_int8 = lora_weights.is_int8.get(key, False)
-                    
                     if is_int8:
-                        # INT8 LoRA: (down, up, down_scale, up_scale, alpha)
                         down, up, down_scale, up_scale, alpha = lora_weights.weights[key]
                     else:
-                        # Float LoRA: (down, up, alpha)
                         down, up, alpha = lora_weights.weights[key]
                         down_scale = None
                         up_scale = None
-                    
-                    # Dimension validation
-                    # down: (rank, in_features), up: (out_features, rank)
-                    # Linear weight: (out_features, in_features)
+
                     if hasattr(target_module, "weight"):
-                        expected_out, expected_in = target_module.weight.shape
-                        actual_out, actual_rank = up.shape
-                        actual_rank_down, actual_in = down.shape
-                        
-                        # Adjust expected_out if we are patching a slice
-                        validation_out = patch_size if patch_size > 0 else expected_out
-                        
-                        if validation_out != actual_out or expected_in != actual_in:
-                            print(f"  [!] Dimension mismatch for {target_key}:")
-                            print(f"      Model: {validation_out}x{expected_in} (Total: {expected_out})")
-                            print(f"      LoRA:  {actual_out}x{actual_in} (rank {actual_rank})")
-                            dim_mismatch_count += 1
+                        mod_out, mod_in = target_module.weight.shape
+
+                        if patch_size > 0:
+                            if patch_offset + patch_size > mod_out:
+                                if debug:
+                                    print(f"Warning: clamping patch for {key}")
+                                patch_size = max(0, mod_out - patch_offset)
+
+                        if mod_in != down.shape[1]:
+                            if debug:
+                                print(f"Skipping {key}: Input mismatch {mod_in} vs {down.shape[1]}")
                             continue
-    
-                    # Get current patches from the module (might be already patched)
-                    current_patches = getattr(target_module, "lora_patches", [])
-                    
-                    # Cache weights on device to avoid redundant transfers on every forward
-                    # We use the model's load_device if available
-                    device = getattr(model, "load_device", torch.device("cpu"))
-                    
-                    if is_int8 or not offload_enabled:
-                        # Move to device during loading if it's INT8 or offloading is disabled
-                        down = down.to(device=device, non_blocking=True)
-                        up = up.to(device=device, non_blocking=True)
-                        if isinstance(down_scale, torch.Tensor):
-                            down_scale = down_scale.to(device=device, non_blocking=True)
-                        if isinstance(up_scale, torch.Tensor):
-                            up_scale = up_scale.to(device=device, non_blocking=True)
-                    # If offload_enabled is True and it's a float LoRA, we keep it on CPU to save VRAM
-                    # and only move it to device during the forward pass.
 
-                    if patch_size > 0 and hasattr(target_module, "weight"):
-                        expected_out = target_module.weight.shape[0]
-                        if patch_offset + patch_size > expected_out:
-                            print(f"  [!] Bounds check failed for {target_key}: offset={patch_offset}, size={patch_size}, output_dim={expected_out}")
-                            # Clamp to valid range
-                            patch_size = max(0, expected_out - patch_offset)
-                            if patch_size <= 0:
-                                print(f"  [!] Skipping patch for {target_key}: size would be <=0 after clamping")
-                                continue
-                            print(f"  [!] Clamped patch_size to {patch_size} for {target_key}")
-                    
-                    if patch_size <= 0 and patch_offset > 0:
-                        print(f"  [!] Skipping patch for {target_key}: invalid patch size {patch_size}")
-                        continue
-                    
-                    # Create a new list with the additional patch
-                    # Store as (down, up, alpha, down_scale, up_scale, offset, size)
                     patch_tuple = (down, up, alpha, down_scale, up_scale, patch_offset, patch_size)
-                    new_patches = current_patches + [patch_tuple]
-                    
-                    # DIRECTLY set the attribute on the module.
-                    # ComfyUI's set_model_patch_replace is for attention processors,
-                    # not for arbitrary attributes on INT8 modules.
-                    target_module.lora_patches = new_patches
-                    
-                    # Also register it in the patcher so it's tracked (optional but good for compatibility)
-                    try:
-                        new_model.set_model_patch_replace(new_patches, target_key, "lora_patches")
-                    except Exception:
-                        pass
-                        
-                    patched_count += 1
-                else:
-                    # Module found but doesn't support lora_patches (e.g. not an INT8 Linear)
-                    pass
-            else:
-                failed_count += 1
-                failed_keys.append(key)
-                if debug:
-                    print(f"[DEBUG] ✗ Failed to match key - tried {len(seen)} candidates")
+                    patches_to_apply.append((target_key, target_module, patch_tuple))
 
-        print(f"LoRA Application Summary:")
-        print(f"  - Successfully patched: {patched_count} layers")
-        if dim_mismatch_count > 0:
-            print(f"  - Dimension mismatches: {dim_mismatch_count} (skipped)")
-        if failed_count > 0:
-            print(f"  - Keys not found in model: {failed_count}")
-            if debug:
-                print(f"\n[DEBUG] Failed keys:")
-                for fk in failed_keys:
-                    print(f"  - {fk}")
-        
-        # Clear modules dict and collect garbage
-        del modules
-        gc.collect()
+            wrappers_to_add = []
+            for target_key, target_module, patch_tuple in patches_to_apply:
+                current_patches = []
+                if target_key in new_model.object_patches:
+                    existing_obj = new_model.object_patches[target_key]
+                    if hasattr(existing_obj, "lora_patches"):
+                        current_patches = list(existing_obj.lora_patches)
+
+                new_patch_list = current_patches + [patch_tuple]
+
+                # Safely determine the raw module to wrap
+                raw_module = target_module
                 
-        return (new_model,)
+                # Unwrap if target_module is already a LoRAWrapperModule
+                if isinstance(raw_module, LoRAWrapperModule):
+                    raw_module = raw_module.wrapped_module  # Use property
+                
+                # Check object_patches for existing wrapper
+                if target_key in new_model.object_patches:
+                    existing = new_model.object_patches[target_key]
+                    if isinstance(existing, LoRAWrapperModule):
+                        raw_module = existing.wrapped_module  # Use property
+                    elif isinstance(existing, torch.nn.Linear):
+                        raw_module = existing
+                
+                # Final safety: ensure we're not wrapping a wrapper
+                while isinstance(raw_module, LoRAWrapperModule):
+                    raw_module = raw_module.wrapped_module  # Use property
+
+                wrapper = LoRAWrapperModule(raw_module, new_patch_list)
+                wrappers_to_add.append((target_key, wrapper))
+
+            with _object_patches_lock:
+                for target_key, wrapper in wrappers_to_add:
+                    new_model.add_object_patch(target_key, wrapper)
+                    patched_count += 1
+
+            print(f"Applied {patched_count} LoRA patches.")
+            return (new_model,)
+            
+        except Exception as e:
+            print(f"Error loading LoRA {lora_name}: {e}")
+            raise
+            
+        finally:
+            if lora_state_dict is not None:
+                del lora_state_dict
+            if lora_weights is not None:
+                del lora_weights
+            if modules is not None:
+                del modules
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
