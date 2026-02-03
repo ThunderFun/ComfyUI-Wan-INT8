@@ -2,7 +2,7 @@
 
 A ComfyUI custom node for fast INT8 quantized inference of Wan video generation models and other diffusion models.
 
-This is a fork of the original Flux INT8 Acceleration project with additional features including extra Triton kernels, CPU offloading, and enhanced LoRA support.
+This is a fork of the original Flux INT8 Acceleration project with additional features including extra Triton kernels and CPU offloading.
 
 > ⚠️ **Disclaimer: This is experimental software and may be unstable or buggy. Features may not work as expected, and breaking changes may occur. Use at your own risk.**
 
@@ -41,7 +41,7 @@ QuIP quantization is recommended because it typically offers high precision and 
 Optional CPU offloading can be enabled via node settings. When enabled, float LoRA weights are kept on CPU and moved to GPU during inference to save VRAM. **Note:** This feature may exhibit bugs when enabled.
 
 ### LoRA Support
-- Custom LoRA loader nodes for INT8 models
+- Custom LoRA loader nodes for INT8 models (⚠️ **CLIP loader is broken**)
 - Supports both float and INT8 quantized LoRAs
 - Memory-efficient chunked forward pass
 - Optional CPU offloading for float LoRA weights
