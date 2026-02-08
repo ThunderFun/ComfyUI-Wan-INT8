@@ -2,12 +2,69 @@ import os
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
+from typing import Callable
 
 _DEBUG_MODE = False
 _DEBUG_FORWARD = False
 
 if __import__('os').environ.get("INT8_DEBUG_MODE", "").lower() in ("1", "true", "yes"):
     _DEBUG_MODE = True
+
+
+def _debug(msg: str):
+    """Minimal debug logger to avoid repeated _DEBUG_MODE checks."""
+    if _DEBUG_MODE:
+        print(msg)
+
+
+def _as_device(t: Tensor | float, device: torch.device) -> Tensor | float:
+    """Ensure tensor is on target device."""
+    if isinstance(t, Tensor) and t.device != device:
+        return t.to(device)
+    return t
+
+
+def _reshape_scale_for_matmul(scale: Tensor | float, rows: int, cols: int, ndim: int) -> Tensor | float:
+    """Reshape scale tensor for proper broadcasting in matmul operations."""
+    if not isinstance(scale, Tensor):
+        return scale
+    if scale.numel() == 1:
+        return scale.view(())
+    if ndim == 1:
+        return scale.view(-1)  # vector
+    if ndim == 2:
+        if scale.numel() == rows:
+            return scale.view(-1, 1)
+        if scale.numel() == cols:
+            return scale.view(1, -1)
+    return scale
+
+
+def _get_chunk_rows(n_rows: int, n_cols: int, target_elements: int) -> int:
+    """Calculate optimal chunk rows for memory-efficient processing."""
+    return max(1, target_elements // max(1, n_cols))
+
+
+def _chunked_apply_rows(
+    x2d: Tensor,
+    out: Tensor,
+    chunk_rows: int,
+    fn: Callable[[Tensor, int, int], Tensor],
+) -> Tensor:
+    """Apply fn to row chunks. fn returns a tensor to write into out[start:end]."""
+    for start in range(0, x2d.shape[0], chunk_rows):
+        end = min(start + chunk_rows, x2d.shape[0])
+        out[start:end] = fn(x2d[start:end], start, end)
+    return out
+
+
+def _scalar_or_vec(s: Tensor | float, rows: int) -> Tensor:
+    """Convert scalar or single-element tensor to vector of given length."""
+    if not isinstance(s, Tensor):
+        return torch.full((rows,), float(s))
+    if s.numel() == 1:
+        return torch.full((rows,), float(s.item()), device=s.device, dtype=s.dtype)
+    return s
 
 _TRITON_AVAILABLE = False
 try:
@@ -98,44 +155,32 @@ def quantize_int8(x: torch.Tensor, scale: float | torch.Tensor) -> torch.Tensor:
         if jit_fn is not None:
             try:
                 return jit_fn(x, float(scale))
-            except (RuntimeError, ValueError, TypeError) as e:
-                if _DEBUG_MODE:
-                    print(f"[DEBUG] JIT quantize_int8 failed, falling back: {type(e).__name__}: {e}")
-            except Exception as e:
-                if _DEBUG_MODE:
-                    print(f"[DEBUG] Unexpected error in JIT quantize_int8: {type(e).__name__}: {e}")
-    
+            except (RuntimeError, ValueError, TypeError):
+                _debug("[DEBUG] JIT quantize failed; fallback")
     return x.float().mul(1.0 / scale).round_().clamp_(-128.0, 127.0).to(torch.int8)
 
 
-def quantize_int8_chunked(x: torch.Tensor, scale: torch.Tensor, chunk_size: int) -> torch.Tensor:
+def quantize_int8_chunked(x: torch.Tensor, scale: torch.Tensor | float, chunk_size: int) -> torch.Tensor:
     """Quantize a tensor to INT8 with chunking for memory efficiency."""
-    total_elements = x.numel()
-    
-    if total_elements <= chunk_size:
+    if x.numel() <= chunk_size:
         return quantize_int8(x, scale)
-    
-    orig_shape = x.shape
-    x_2d = x.reshape(-1, x.shape[-1])
-    result = torch.empty_like(x_2d, dtype=torch.int8)
-    
-    chunk_rows = max(1, chunk_size // x_2d.shape[1])
-    
-    for start_row in range(0, x_2d.shape[0], chunk_rows):
-        end_row = min(start_row + chunk_rows, x_2d.shape[0])
-        chunk = x_2d[start_row:end_row]
-        
-        if isinstance(scale, torch.Tensor) and scale.numel() > 1:
+
+    x2d = x.reshape(-1, x.shape[-1])
+    out = torch.empty_like(x2d, dtype=torch.int8)
+
+    chunk_rows = _get_chunk_rows(x2d.shape[0], x2d.shape[1], chunk_size)
+
+    def _quant_chunk(chunk: Tensor, start: int, end: int) -> Tensor:
+        if isinstance(scale, Tensor) and scale.numel() > 1:
             if scale.ndim == 2:
-                chunk_scale = scale[start_row:end_row]
+                chunk_scale = scale[start:end]
             else:
-                chunk_scale = scale[start_row:end_row].view(-1, 1) if x_2d.ndim == 2 else scale[start_row:end_row]
+                chunk_scale = scale[start:end].view(-1, 1)
         else:
             chunk_scale = scale
-        
-        result[start_row:end_row] = quantize_int8(chunk, chunk_scale)
-    
-    return result.reshape(orig_shape)
+        return quantize_int8(chunk, chunk_scale)
+
+    return _chunked_apply_rows(x2d, out, chunk_rows, _quant_chunk).reshape_as(x)
 
 
 def _check_nan_inf(tensor: torch.Tensor, name: str, location: str = ""):
@@ -156,131 +201,114 @@ def _check_nan_inf(tensor: torch.Tensor, name: str, location: str = ""):
             print(f"[DEBUG]{loc_str} Inf detected in {name}: {inf_count} values")
 
 
+def _apply_hadamard_transform(w: Tensor, hadamard_size: int, sign_vec: Tensor | None = None) -> Tensor:
+    """Apply Hadamard transform with fallback to PyTorch implementation."""
+    if hadamard_size <= 0:
+        return w
+    try:
+        from .triton_kernels import triton_hadamard_transform
+        w = triton_hadamard_transform(w, normalize=True)
+    except (ImportError, RuntimeError, ValueError) as e:
+        _debug(f"[DEBUG] Hadamard transform fallback: {type(e).__name__}")
+        w = _pytorch_fwht_simple(w)
+    if sign_vec is not None and sign_vec.shape[0] >= hadamard_size:
+        w = w * sign_vec[:hadamard_size].unsqueeze(0)
+    return w
+
+
 def dequantize(q: Tensor, scale: float | Tensor, quip_s_u: Tensor | None = None, quip_s_v: Tensor | None = None,
                hadamard_quip: bool = False, hadamard_size_in: int = 0, hadamard_size_out: int = 0,
                sign_row: Tensor | None = None, sign_col: Tensor | None = None) -> Tensor:
     """Dequantize INT8 tensor to float."""
     total_elements = q.numel()
-    
+
+    rows = q.shape[0] if q.ndim >= 1 else 1
+    cols = q.shape[1] if q.ndim >= 2 else 1
+
+    # Handle 1D safely (bypass Hadamard/QuIP paths)
+    if q.ndim == 1:
+        scale = _reshape_scale_for_matmul(scale, rows, cols, q.ndim)
+        scale = _as_device(scale, q.device)
+        return q.float().mul(scale)
+
+    # --- Hadamard-QuIP path ---
     if hadamard_quip and (hadamard_size_in > 0 or hadamard_size_out > 0):
-        w = q.float() * (scale.view(-1, 1) if isinstance(scale, Tensor) and scale.numel() > 1 else scale)
-        
-        device = w.device
+        scale = _reshape_scale_for_matmul(scale, rows, cols, q.ndim)
+        scale = _as_device(scale, q.device)
+        if sign_row is not None:
+            sign_row = _as_device(sign_row, q.device)
+        if sign_col is not None:
+            sign_col = _as_device(sign_col, q.device)
+
+        w = q.float() * scale
         dtype = w.dtype
-        
         N, K = w.shape
+
+        # Pad to Hadamard dimensions
         if hadamard_size_out > 0 and N < hadamard_size_out:
             w = torch.nn.functional.pad(w, (0, 0, 0, hadamard_size_out - N))
         if hadamard_size_in > 0 and K < hadamard_size_in:
             w = torch.nn.functional.pad(w, (0, hadamard_size_in - K, 0, 0))
-        
-        w = w.T
-        
-        if hadamard_size_out > 0:
-            try:
-                from .triton_kernels import triton_hadamard_transform
-                w = triton_hadamard_transform(w, normalize=True)
-            except ImportError as e:
-                if _DEBUG_MODE:
-                    print(f"[DEBUG] Hadamard transform import failed, using PyTorch fallback: {e}")
-                w = _pytorch_fwht_simple(w)
-            except (RuntimeError, ValueError) as e:
-                if _DEBUG_MODE:
-                    print(f"[DEBUG] Hadamard transform failed, using PyTorch fallback: {type(e).__name__}: {e}")
-                w = _pytorch_fwht_simple(w)
-        
-        if sign_row is not None and hadamard_size_out > 0:
-            sign_row_expanded = sign_row[:hadamard_size_out] if sign_row.shape[0] >= hadamard_size_out else sign_row
-            w = w * sign_row_expanded.unsqueeze(0)
-        
-        w = w.T
-        
-        if hadamard_size_in > 0:
-            try:
-                from .triton_kernels import triton_hadamard_transform
-                w = triton_hadamard_transform(w, normalize=True)
-            except ImportError as e:
-                if _DEBUG_MODE:
-                    print(f"[DEBUG] Hadamard transform import failed, using PyTorch fallback: {e}")
-                w = _pytorch_fwht_simple(w)
-            except (RuntimeError, ValueError) as e:
-                if _DEBUG_MODE:
-                    print(f"[DEBUG] Hadamard transform failed, using PyTorch fallback: {type(e).__name__}: {e}")
-                w = _pytorch_fwht_simple(w)
-        
-        if sign_col is not None and hadamard_size_in > 0:
-            sign_col_expanded = sign_col[:hadamard_size_in] if sign_col.shape[0] >= hadamard_size_in else sign_col
-            w = w * sign_col_expanded.unsqueeze(0)
-        
+
+        # Apply Hadamard transforms
+        w = _apply_hadamard_transform(w.T, hadamard_size_out, sign_row).T
+        w = _apply_hadamard_transform(w, hadamard_size_in, sign_col)
+
+        # Slice back to original dimensions
         if hadamard_size_out > 0 and N < hadamard_size_out:
             w = w[:N, :]
         if hadamard_size_in > 0 and K < hadamard_size_in:
             w = w[:, :K]
-        
+
         return w.to(dtype)
-    
+
+    # --- QuIP path ---
     if quip_s_u is not None and quip_s_v is not None:
-        w = q.float() * (scale.view(-1, 1) if isinstance(scale, Tensor) and scale.numel() > 1 else scale)
+        scale = _reshape_scale_for_matmul(scale, rows, cols, q.ndim)
+        scale = _as_device(scale, q.device)
+
+        w = q.float() * scale
         N, K = w.shape
-        u = quip_s_u.to(w.dtype)
-        v = quip_s_v.to(w.dtype)
-        
+        u = quip_s_u.to(device=w.device, dtype=w.dtype)
+        v = quip_s_v.to(device=w.device, dtype=w.dtype)
+
         if u.numel() == N and v.numel() == K:
             res = u.unsqueeze(1) * w * v.unsqueeze(0)
             return res.squeeze() if q.ndim == 1 else res
-        elif u.numel() == N * N and v.numel() == K * K:
-            u = u.reshape(N, N)
-            v = v.reshape(K, K)
-            res = u @ w @ v.T
-            return res.squeeze() if q.ndim == 1 else res
-        else:
-            if _DEBUG_MODE:
-                print(f"[QuIP# WARNING] Unexpected sign vector sizes: u={u.shape}, v={v.shape}, w={w.shape}")
-            return w
+        if u.numel() == N * N and v.numel() == K * K:
+            return (u.view(N, N) @ w @ v.view(K, K).T).squeeze()
+        _debug(f"[QuIP# WARNING] Unexpected sign vector sizes: u={u.shape}, v={v.shape}, w={w.shape}")
+        return w
 
+    # --- JIT fast path ---
     if isinstance(scale, (int, float)) and total_elements <= CHUNK_THRESHOLD_ELEMENTS:
         jit_fn = _get_dequantize_jit()
         if jit_fn is not None:
             try:
                 return jit_fn(q, float(scale))
-            except (RuntimeError, ValueError, TypeError) as e:
-                if _DEBUG_MODE:
-                    print(f"[DEBUG] JIT dequantize failed, falling back: {type(e).__name__}: {e}")
-            except Exception as e:
-                if _DEBUG_MODE:
-                    print(f"[DEBUG] Unexpected error in JIT dequantize: {type(e).__name__}: {e}")
+            except (RuntimeError, ValueError, TypeError):
+                _debug("[DEBUG] JIT dequantize failed; fallback")
 
+    # --- Chunked path ---
     if total_elements > CHUNK_THRESHOLD_ELEMENTS:
-        result = torch.empty_like(q, dtype=torch.float32)
-        chunk_rows = max(1, CHUNK_TARGET_ELEMENTS // q.shape[-1])
-        
-        for start_row in range(0, q.shape[0], chunk_rows):
-            end_row = min(start_row + chunk_rows, q.shape[0])
-            chunk = q[start_row:end_row]
-            
+        q2d = q.reshape(-1, q.shape[-1])
+        out = torch.empty_like(q2d, dtype=torch.float32)
+        chunk_rows = _get_chunk_rows(q2d.shape[0], q2d.shape[1], CHUNK_TARGET_ELEMENTS)
+
+        def _dq_chunk(chunk: Tensor, start: int, end: int) -> Tensor:
             if isinstance(scale, Tensor) and scale.numel() > 1:
-                if scale.ndim == 2:
-                    chunk_scale = scale[start_row:end_row]
-                else:
-                    chunk_scale = scale[start_row:end_row].view(-1, 1) if q.ndim == 2 else scale[start_row:end_row]
+                chunk_scale = scale[start:end] if scale.ndim == 2 else scale[start:end].view(-1, 1)
             else:
                 chunk_scale = scale
-            
-                if isinstance(chunk_scale, Tensor) and chunk_scale.device != chunk.device:
-                    chunk_scale = chunk_scale.to(chunk.device)
-            
-            result[start_row:end_row] = chunk.float() * chunk_scale
-            del chunk
-        
-        return result
-    
-    if isinstance(scale, Tensor) and scale.numel() > 1:
-        scale = scale.view(-1, 1) if q.ndim == 2 else scale.view(-1)
-    
-    if isinstance(scale, Tensor) and scale.device != q.device:
-        scale = scale.to(q.device)
-    
-    return q.float() * scale
+            chunk_scale = _as_device(chunk_scale, chunk.device)
+            return chunk.float().mul(chunk_scale)
+
+        return _chunked_apply_rows(q2d, out, chunk_rows, _dq_chunk).reshape_as(q)
+
+    # --- Normal path ---
+    scale = _reshape_scale_for_matmul(scale, *q.shape[:2], q.ndim)
+    scale = _as_device(scale, q.device)
+    return q.float().mul(scale)
 
 
 def _is_power_of_two(n: int) -> bool:
@@ -405,10 +433,11 @@ def convert_zimage_diffusers_state_dict(sd):
                 
                 if "to_q.weight_scale" in params and "to_k.weight_scale" in params and "to_v.weight_scale" in params:
                     q_s, k_s, v_s = params["to_q.weight_scale"], params["to_k.weight_scale"], params["to_v.weight_scale"]
-                    def to_vec(s, rows):
-                        if not isinstance(s, torch.Tensor): return torch.full((rows,), float(s))
-                        return torch.full((rows,), float(s.item()), device=s.device, dtype=s.dtype) if s.numel() == 1 else s
-                    new_sd[f"{prefix}.qkv.weight_scale"] = torch.cat([to_vec(q_s, q_w.shape[0]), to_vec(k_s, k_w.shape[0]), to_vec(v_s, v_w.shape[0])], dim=0)
+                    new_sd[f"{prefix}.qkv.weight_scale"] = torch.cat([
+                        _scalar_or_vec(q_s, q_w.shape[0]),
+                        _scalar_or_vec(k_s, k_w.shape[0]),
+                        _scalar_or_vec(v_s, v_w.shape[0])
+                    ], dim=0)
             
             if "to_q.bias" in params and "to_k.bias" in params and "to_v.bias" in params:
                 new_sd[f"{prefix}.qkv.bias"] = torch.cat([params["to_q.bias"], params["to_k.bias"], params["to_v.bias"]], dim=0)
@@ -548,97 +577,75 @@ else:
 
 
 @torch.no_grad()
-def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor, bias: Tensor | None, compute_dtype: torch.dtype, chunk_size: int = 0, has_lora: bool = False, offload_to_cpu: bool = False) -> Tensor:
+def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor, bias: Tensor | None,
+                         compute_dtype: torch.dtype, chunk_size: int = 0,
+                         has_lora: bool = False, offload_to_cpu: bool = False) -> Tensor:
     """Forward with dynamic per-token activation quantization."""
     output_dtype = compute_dtype if (has_lora and offload_to_cpu) else (torch.float32 if has_lora else compute_dtype)
-    
-    if chunk_size > 0 and x.shape[0] > chunk_size:
-        out = torch.empty((x.shape[0], weight.shape[0]), device=x.device, dtype=output_dtype)
-        for i in range(0, x.shape[0], chunk_size):
-            chunk = x[i:i+chunk_size]
-            out[i:i+chunk_size] = int8_forward_dynamic(chunk, weight, weight_scale, bias, compute_dtype, chunk_size=0, has_lora=has_lora, offload_to_cpu=offload_to_cpu)
-            del chunk
-        return out
 
-    _log_memory("int8_forward_dynamic start", is_forward=True)
-    _log_tensor_size("input x", x, is_forward=True)
-    
+    x_shape = x.shape
+    x_2d = x.reshape(-1, x_shape[-1])
+
+    if chunk_size > 0 and x_2d.shape[0] > chunk_size:
+        out = torch.empty((x_2d.shape[0], weight.shape[0]), device=x.device, dtype=output_dtype)
+        _chunked_apply_rows(
+            x_2d, out, chunk_size,
+            lambda c, s, e: int8_forward_dynamic(c, weight, weight_scale, bias, compute_dtype)
+        )
+        return out.reshape(*x_shape[:-1], out.shape[-1])
+
+    x = x_2d
     _check_nan_inf(x, "input x", "int8_forward_dynamic")
-    
+
     triton_kernels = _get_triton_kernels()
     if triton_kernels is not None and x.ndim >= 2:
         try:
             _log_kernel_usage("w8a8_dynamic_triton", "int8_forward_dynamic")
             return triton_kernels(x, weight, weight_scale, bias, compute_dtype, use_fp32_output=has_lora)
         except (RuntimeError, ValueError) as e:
-            if _DEBUG_MODE:
-                print(f"[DEBUG] Triton fallback in int8_forward_dynamic: {type(e).__name__}: {e}")
-    
+            _debug(f"[DEBUG] Triton fallback: {type(e).__name__}: {e}")
+
     x_8, x_scale = quantize_int8_axiswise(x, dim=-1)
-    x_8_contig = x_8.contiguous() if not x_8.is_contiguous() else x_8
-    weight_T = weight.T.contiguous() if not weight.T.is_contiguous() else weight.T
-    res = torch._int_mm(x_8_contig, weight_T)
-    del x_8, x_8_contig, weight_T
-    
-    _log_tensor_size("int_mm result (INT32)", res, is_forward=True)
-    
+    res = torch._int_mm(x_8.contiguous(), weight.T.contiguous())
     scale = x_scale * weight_scale
-    
-    _log_memory("before float conversion (CRITICAL POINT)", is_forward=True)
-    
-    total_elements = res.numel()
-    
-    if total_elements > CHUNK_THRESHOLD_ELEMENTS:
-        chunk_rows = max(1, (CHUNK_TARGET_ELEMENTS // res.shape[1]))
-        
-        if _DEBUG_MODE:
-            print(f"[CHUNK] Large tensor detected: {res.shape}, processing in chunks of {chunk_rows} rows")
-        
-        res_scaled = torch.empty_like(res, dtype=output_dtype)
-        
-        for start_row in range(0, res.shape[0], chunk_rows):
-            end_row = min(start_row + chunk_rows, res.shape[0])
-            
-            chunk_int32 = res[start_row:end_row]
-            
+
+    if res.numel() > CHUNK_THRESHOLD_ELEMENTS:
+        res_f = torch.empty_like(res, dtype=output_dtype)
+        chunk_rows = _get_chunk_rows(res.shape[0], res.shape[1], CHUNK_TARGET_ELEMENTS)
+
+        def _scale_chunk(chunk: Tensor, start: int, end: int) -> Tensor:
             if scale.numel() == 1 or scale.shape[0] == 1:
-                res_scaled[start_row:end_row] = chunk_int32.float().mul_(scale).to(output_dtype)
-            else:
-                chunk_scale = scale[start_row:end_row]
-                res_scaled[start_row:end_row] = chunk_int32.float().mul_(chunk_scale).to(output_dtype)
-            
-            del chunk_int32
-        
-        if _DEBUG_MODE:
-            print(f"[CHUNK] Completed chunked processing")
+                return chunk.float().mul(scale).to(output_dtype)
+            return chunk.float().mul(scale[start:end]).to(output_dtype)
+
+        res_f = _chunked_apply_rows(res, res_f, chunk_rows, _scale_chunk)
     else:
-        res_scaled = res.float().mul_(scale).to(output_dtype)
-    
-    _log_memory("after float conversion", is_forward=True)
-    
-    del res, scale, x_scale
-    
+        res_f = res.float().mul(scale).to(output_dtype)
+
     if bias is not None:
-        res_scaled.add_(bias.to(output_dtype))
-    
-    _check_nan_inf(res_scaled, "output", "int8_forward_dynamic")
-    
-    return res_scaled
+        res_f.add_(bias.to(output_dtype))
+
+    _check_nan_inf(res_f, "output", "int8_forward_dynamic")
+    return res_f
 
 
 @torch.no_grad()
 def int8_forward_static(x: Tensor, weight: Tensor, weight_scale: float | Tensor, input_scale: float | Tensor, bias: Tensor | None, compute_dtype: torch.dtype, chunk_size: int = 0, has_lora: bool = False, offload_to_cpu: bool = False) -> Tensor:
     """Forward with static (learned) activation quantization."""
     output_dtype = compute_dtype if (has_lora and offload_to_cpu) else (torch.float32 if has_lora else compute_dtype)
-    
-    if chunk_size > 0 and x.shape[0] > chunk_size:
-        out = torch.empty((x.shape[0], weight.shape[0]), device=x.device, dtype=output_dtype)
-        for i in range(0, x.shape[0], chunk_size):
-            chunk = x[i:i+chunk_size]
+
+    x_shape = x.shape
+    x_2d = x.reshape(-1, x_shape[-1])
+
+    if chunk_size > 0 and x_2d.shape[0] > chunk_size:
+        out = torch.empty((x_2d.shape[0], weight.shape[0]), device=x.device, dtype=output_dtype)
+        for i in range(0, x_2d.shape[0], chunk_size):
+            chunk = x_2d[i:i+chunk_size]
             out[i:i+chunk_size] = int8_forward_static(chunk, weight, weight_scale, input_scale, bias, compute_dtype, chunk_size=0, has_lora=has_lora, offload_to_cpu=offload_to_cpu)
             del chunk
-        return out
-    
+        return out.reshape(*x_shape[:-1], out.shape[-1])
+
+    x = x_2d
     x_8 = quantize_int8(x, input_scale)
     x_8_contig = x_8.contiguous() if not x_8.is_contiguous() else x_8
     weight_T = weight.T.contiguous() if not weight.T.is_contiguous() else weight.T

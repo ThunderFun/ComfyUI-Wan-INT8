@@ -1,3 +1,4 @@
+from collections import OrderedDict
 import os
 import copy
 import torch
@@ -131,6 +132,22 @@ def _is_zero_alpha(a):
     return a == 0
 
 
+def _parse_patch(patch):
+    """Normalize LoRA patch tuple parsing."""
+    if not isinstance(patch, (list, tuple)):
+        return None
+
+    if len(patch) == 3:
+        d, u, a = patch
+        return d, u, a, None, None, 0, 0
+    if len(patch) == 5:
+        d, u, a, d_scale, u_scale = patch
+        return d, u, a, d_scale, u_scale, 0, 0
+    if len(patch) == 7:
+        return patch
+    return None
+
+
 def _identify_qkv_component(key: str) -> tuple:
     """Identify which QKV component a LoRA key targets."""
     key_lower = key.lower()
@@ -192,13 +209,11 @@ class LoRAWeightCache:
 
     def __init__(self, max_size=_MAX_LORA_CACHE_SIZE):
         self.max_size = max_size
-        self._cache = {}
-        self._access_order = []
+        self._cache = OrderedDict()
         self._lock = threading.RLock()
         self._ref_counts = {}
 
     def _check_memory_pressure(self):
-        """Check if GPU memory is under pressure."""
         if not torch.cuda.is_available():
             return False
         try:
@@ -207,131 +222,75 @@ class LoRAWeightCache:
         except Exception:
             return False
 
-    def _evict_for_memory(self):
-        """Evict entries to free GPU memory."""
-        evicted = 0
-        for key in list(self._access_order):
+    def _release_tensor(self, value):
+        if isinstance(value, dict):
+            for v in value.values():
+                if isinstance(v, torch.Tensor):
+                    del v
+        elif isinstance(value, torch.Tensor):
+            del value
+
+    def _evict_one(self):
+        for key in list(self._cache.keys()):
             if self._ref_counts.get(key, 0) == 0:
-                try:
-                    self._access_order.remove(key)
-                except ValueError:
-                    pass
-                if key in self._cache:
-                    value = self._cache.pop(key)
-                    if isinstance(value, dict):
-                        for v in value.values():
-                            if isinstance(v, torch.Tensor):
-                                del v
-                    elif isinstance(value, torch.Tensor):
-                        del value
-                    evicted += 1
+                value = self._cache.pop(key, None)
+                if value is not None:
+                    self._release_tensor(value)
                 self._ref_counts.pop(key, None)
-                
-                if evicted >= 2 and not self._check_memory_pressure():
-                    break
-        
+                return True
+        return False
+
+    def _evict_for_memory(self):
+        evicted = 0
+        while self._check_memory_pressure():
+            if not self._evict_one():
+                break
+            evicted += 1
         if evicted > 0:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-        
         return evicted
 
-    def get(self, key):
-        """Get cached value directly (no clone for performance)."""
-        with self._lock:
-            if key in self._cache:
-                try:
-                    self._access_order.remove(key)
-                except ValueError:
-                    pass
-                self._access_order.append(key)
-                self._ref_counts[key] = self._ref_counts.get(key, 0) + 1
-                return self._cache[key]
-            return None
-
     def get_or_create(self, key, factory_fn):
-        """Atomically get existing value or create and cache new one."""
         with self._lock:
-            if self._check_memory_pressure():
-                self._evict_for_memory()
-            
             if key in self._cache:
-                try:
-                    self._access_order.remove(key)
-                except ValueError:
-                    pass
-                self._access_order.append(key)
+                self._cache.move_to_end(key)
                 self._ref_counts[key] = self._ref_counts.get(key, 0) + 1
-                return (self._cache[key], False)
-            
+                return self._cache[key], True  # cached
+
             if len(self._cache) >= self.max_size:
-                self._evict_oldest()
-            
+                evicted = self._evict_one()
+                if not evicted:
+                    # Return uncached value to avoid unbounded growth
+                    return factory_fn(), False
+
             value = factory_fn()
-            
             self._cache[key] = value
-            self._access_order.append(key)
             self._ref_counts[key] = 1
-            
-            return (value, True)
+            return value, True  # cached
 
     def release(self, key):
-        """Release a reference obtained via get()."""
         with self._lock:
             if key in self._ref_counts:
                 self._ref_counts[key] -= 1
                 if self._ref_counts[key] <= 0:
                     del self._ref_counts[key]
-                    if self._check_memory_pressure() and key in self._cache:
-                        try:
-                            self._access_order.remove(key)
-                        except ValueError:
-                            pass
+                    if self._check_memory_pressure():
                         value = self._cache.pop(key, None)
                         if value is not None:
-                            if isinstance(value, dict):
-                                for v in value.values():
-                                    if isinstance(v, torch.Tensor):
-                                        del v
-                            elif isinstance(value, torch.Tensor):
-                                del value
-
-    def _evict_oldest(self):
-        """Evict oldest entry with zero reference count. Caller must hold self._lock."""
-        for key in list(self._access_order):
-            if self._ref_counts.get(key, 0) == 0:
-                self._access_order.remove(key)
-                if key in self._cache:
-                    self._cache.pop(key)
-                return True
-        return False
+                            self._release_tensor(value)
 
     def clear(self):
-        """Clear cache entries with zero reference count."""
         with self._lock:
-            keys_to_evict = [k for k in self._access_order
-                            if self._ref_counts.get(k, 0) == 0]
-            
-            for key in keys_to_evict:
-                if key in self._cache:
-                    value = self._cache.pop(key)
-                    if isinstance(value, dict):
-                        for v in value.values():
-                            if isinstance(v, torch.Tensor):
-                                del v
-                    elif isinstance(value, torch.Tensor):
-                        del value
-                try:
-                    self._access_order.remove(key)
-                except ValueError:
-                    pass
-                self._ref_counts.pop(key, None)
-            
-            if keys_to_evict:
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            for key in list(self._cache.keys()):
+                if self._ref_counts.get(key, 0) == 0:
+                    value = self._cache.pop(key, None)
+                    if value is not None:
+                        self._release_tensor(value)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 class LoRAWrapperModule(torch.nn.Module):
@@ -551,42 +510,27 @@ class LoRAWrapperModule(torch.nn.Module):
                 self._lora_weight_cache.clear()
             self._last_patch_ids = current_patch_ids
 
-        x_shape = x.shape
-        x_2d = x.reshape(-1, x_shape[-1])
+        x_2d = x.reshape(-1, x.shape[-1])
         if not x_2d.is_contiguous():
             x_2d = x_2d.contiguous()
 
         out = original_out.clone()
         keys_to_release = set()
         any_patch_applied = False
-        
+
         try:
             for patch_data in patches:
-                if not isinstance(patch_data, (list, tuple)):
+                parsed = _parse_patch(patch_data)
+                if parsed is None:
                     continue
 
-                patch_len = len(patch_data)
-                if patch_len == 3:
-                    d, u, a = patch_data
-                    d_scale, u_scale = None, None
-                    offset, size = 0, 0
-                elif patch_len == 5:
-                    d, u, a, d_scale, u_scale = patch_data
-                    offset, size = 0, 0
-                elif patch_len == 7:
-                    d, u, a, d_scale, u_scale, offset, size = patch_data
-                else:
+                d, u, a, d_scale, u_scale, offset, size = parsed
+                if not all(isinstance(t, torch.Tensor) for t in (d, u)):
                     continue
-
-                if not all(isinstance(t, torch.Tensor) for t in [d, u]):
-                    continue
-
                 if not _is_valid_alpha(a):
                     continue
 
-                is_int8 = d.dtype == torch.int8 and u.dtype == torch.int8
                 expected_input_dim = d.shape[1]
-                
                 if expected_input_dim != x_2d.shape[-1]:
                     continue
 
@@ -597,72 +541,67 @@ class LoRAWrapperModule(torch.nn.Module):
                 if not is_valid:
                     continue
 
-                try:
-                    if is_int8 and d_scale is not None and u_scale is not None:
-                        cache_key = (
-                            "int8",
-                            _get_tensor_content_hash(d), _get_tensor_content_hash(u),
-                            _get_tensor_content_hash(d_scale), _get_tensor_content_hash(u_scale),
-                            offset, size, original_out.shape[-1],
-                        )
-                        
-                        def create_int8_cache(d=d, u=u, d_scale=d_scale, u_scale=u_scale, device=original_out.device):
-                            return {
-                                'd': d.to(device=device, non_blocking=True),
-                                'u': u.to(device=device, non_blocking=True),
-                                'd_scale': d_scale.to(device=device, non_blocking=True) if isinstance(d_scale, torch.Tensor) else d_scale,
-                                'u_scale': u_scale.to(device=device, non_blocking=True) if isinstance(u_scale, torch.Tensor) else u_scale,
-                            }
+                is_int8 = d.dtype == torch.int8 and u.dtype == torch.int8
+                if is_int8 and d_scale is not None and u_scale is not None:
+                    cache_key = (
+                        "int8",
+                        _get_tensor_content_hash(d), _get_tensor_content_hash(u),
+                        _get_tensor_content_hash(d_scale), _get_tensor_content_hash(u_scale),
+                        offset, size, original_out.shape[-1],
+                    )
 
-                        cached, _ = self._lora_weight_cache.get_or_create(cache_key, create_int8_cache)
+                    def create_int8_cache(d=d, u=u, d_scale=d_scale, u_scale=u_scale, device=original_out.device):
+                        return {
+                            "d": d.to(device=device, non_blocking=True),
+                            "u": u.to(device=device, non_blocking=True),
+                            "d_scale": d_scale.to(device=device, non_blocking=True) if isinstance(d_scale, torch.Tensor) else d_scale,
+                            "u_scale": u_scale.to(device=device, non_blocking=True) if isinstance(u_scale, torch.Tensor) else u_scale,
+                        }
+
+                    cached, is_cached = self._lora_weight_cache.get_or_create(cache_key, create_int8_cache)
+                    if is_cached:
                         keys_to_release.add(cache_key)
 
-                        chunked_int8_lora_forward(
-                            x_2d, cached['d'], cached['u'],
-                            cached['d_scale'], cached['u_scale'],
-                            a, out, offset=offset, size=size
-                        )
-                        any_patch_applied = True
-                    else:
-                        curr_x = x_2d if x_2d.dtype == original_out.dtype else x_2d.to(dtype=original_out.dtype)
+                    chunked_int8_lora_forward(
+                        x_2d, cached["d"], cached["u"],
+                        cached["d_scale"], cached["u_scale"],
+                        a, out, offset=offset, size=size
+                    )
+                    any_patch_applied = True
+                else:
+                    curr_x = x_2d if x_2d.dtype == original_out.dtype else x_2d.to(dtype=original_out.dtype)
 
-                        cache_key = (
-                            "float",
-                            _get_tensor_content_hash(d), _get_tensor_content_hash(u),
-                            original_out.dtype, offset, size, original_out.shape[-1],
-                        )
+                    cache_key = (
+                        "float",
+                        _get_tensor_content_hash(d), _get_tensor_content_hash(u),
+                        original_out.dtype, offset, size, original_out.shape[-1],
+                    )
 
-                        def create_float_cache(d=d, u=u, device=original_out.device, dtype=original_out.dtype):
-                            return {
-                                'd': d.to(device=device, dtype=dtype, non_blocking=True),
-                                'u': u.to(device=device, dtype=dtype, non_blocking=True),
-                            }
+                    def create_float_cache(d=d, u=u, device=original_out.device, dtype=original_out.dtype):
+                        return {
+                            "d": d.to(device=device, dtype=dtype, non_blocking=True),
+                            "u": u.to(device=device, dtype=dtype, non_blocking=True),
+                        }
 
-                        cached, _ = self._lora_weight_cache.get_or_create(cache_key, create_float_cache)
+                    cached, is_cached = self._lora_weight_cache.get_or_create(cache_key, create_float_cache)
+                    if is_cached:
                         keys_to_release.add(cache_key)
 
-                        chunked_lora_forward(
-                            curr_x, cached['d'], cached['u'],
-                            a, out, offset=offset, size=size
-                        )
-                        any_patch_applied = True
-                
-                except Exception as e:
-                    print(f"Error computing LoRA patch: {e}")
-                    continue
+                    chunked_lora_forward(
+                        curr_x, cached["d"], cached["u"],
+                        a, out, offset=offset, size=size
+                    )
+                    any_patch_applied = True
 
             if any_patch_applied:
                 return out
-            else:
-                del out
-                return original_out
+
+            del out
+            return original_out
 
         finally:
             for key in keys_to_release:
-                try:
-                    self._lora_weight_cache.release(key)
-                except Exception:
-                    pass
+                self._lora_weight_cache.release(key)
 
 
 class WanLoRALoader:
@@ -734,19 +673,15 @@ class WanLoRALoader:
                     for key, value in list(original_patches.items()):
                         if isinstance(value, LoRAWrapperModule):
                             value._lora_weight_cache.clear()
-                            
+
                             try:
-                                new_object_patches[key] = copy.deepcopy(value)
+                                # Rebuild wrapper without deepcopying the wrapped module
+                                wrapped = value.wrapped_module
+                                patches = list(value.lora_patches) if value.lora_patches else []
+                                new_object_patches[key] = LoRAWrapperModule(wrapped, patches)
                             except Exception as e:
-                                print(f"Warning: Rebuilding patch {key} due to deepcopy failure: {e}")
-                                try:
-                                    wrapped = value.wrapped_module
-                                    patches = list(value.lora_patches) if value.lora_patches else []
-                                    new_wrapper = LoRAWrapperModule(wrapped, patches)
-                                    new_object_patches[key] = new_wrapper
-                                except Exception as e2:
-                                    print(f"Error: Could not rebuild patch {key}: {e2}")
-                                    new_object_patches[key] = value
+                                print(f"Warning: Rebuilding patch {key} failed: {e}")
+                                new_object_patches[key] = value
                         else:
                             try:
                                 new_object_patches[key] = copy.deepcopy(value)

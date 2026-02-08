@@ -50,18 +50,19 @@ _shown_kernel_info = False
 def pick_gemm_kernel_with_logging(device=None):
     """Select the best GEMM kernel with optional logging."""
     global _shown_kernel_info
-    
+
     if not torch.cuda.is_available():
         return _int8_matmul_dequant_kernel
-    
-    # Check for forced kernel override
-    if _FORCE_KERNEL:
-        if _FORCE_KERNEL == "ampere":
+
+    # Re-read environment variable to allow runtime override
+    force_kernel = os.environ.get("INT8_FORCE_KERNEL", "").lower()
+    if force_kernel:
+        if force_kernel == "ampere":
             if not _shown_kernel_info and _LOG_KERNEL_SELECTION:
                 print(f"[INT8 KERNEL] Forced Ampere autotuned kernel")
                 _shown_kernel_info = True
             return _int8_gemm_dequant_ampere
-        elif _FORCE_KERNEL == "fixed" or _FORCE_KERNEL == "fallback":
+        elif force_kernel in ("fixed", "fallback"):
             if not _shown_kernel_info and _LOG_KERNEL_SELECTION:
                 print(f"[INT8 KERNEL] Forced fixed fallback kernel")
                 _shown_kernel_info = True
@@ -356,6 +357,10 @@ def triton_hadamard_transform(
     
     inplace_requested = output is not None and output.data_ptr() == x.data_ptr()
     
+    # Guard against unsafe in-place on non-contiguous tensors
+    if inplace_requested and not x.is_contiguous():
+        raise ValueError("In-place Hadamard requires contiguous tensor.")
+    
     if inplace_requested:
         if not x.is_contiguous():
             output.copy_(x)
@@ -445,21 +450,22 @@ def fast_hadamard_transform_2d(
     inplace: bool = False
 ) -> torch.Tensor:
     """Apply Fast Hadamard Transform to both dimensions: result = H @ X @ H.T"""
-    n_rows = x.shape[-2]
-    n_cols = x.shape[-1]
-    
+    x_orig = x
     if not inplace:
         x = x.clone()
-    
+
     # First pass: transform columns WITHOUT normalization
     x = triton_hadamard_transform(x, normalize=False, output=x if inplace else None)
-    
-    # Second pass: transform rows WITH combined normalization
-    x = x.transpose(-2, -1)
-    x = triton_hadamard_transform(x, normalize=normalize, output=x)
-    x = x.transpose(-2, -1)
-    
-    return x
+
+    # Second pass: transform rows; must be contiguous
+    x_t = x.transpose(-2, -1).contiguous()
+    x_t = triton_hadamard_transform(x_t, normalize=normalize)
+    x_out = x_t.transpose(-2, -1).contiguous()
+
+    if inplace:
+        x_orig.copy_(x_out)
+        return x_orig
+    return x_out
 
 # Kernel: Fused Row-wise Quantization (FP16/BF16 -> INT8 + Scale)
 
@@ -469,39 +475,33 @@ def _quantize_rowwise_kernel(
     x_ptr,
     y_ptr,
     s_ptr,
-    n_elements,
+    n_elements: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     row_idx = tl.program_id(0)
-    
+
     x_row_ptr = x_ptr + row_idx * n_elements
     y_row_ptr = y_ptr + row_idx * n_elements
-    
-    # Compute Max Abs Value for the row
+
     max_val = 0.0
-    for i in range(0, n_elements, BLOCK_SIZE):
+    for i in tl.static_range(0, n_elements, BLOCK_SIZE):
         offsets = i + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
         x = tl.load(x_row_ptr + offsets, mask=mask, other=0.0)
         abs_x = tl.abs(x)
         local_max = tl.max(abs_x, axis=0)
         max_val = tl.maximum(max_val, local_max)
-    
-    # Compute Scale
+
     scale = tl.maximum(max_val / 127.0, 1e-30)
-    
-    # Quantize and Store
-    for i in range(0, n_elements, BLOCK_SIZE):
+
+    for i in tl.static_range(0, n_elements, BLOCK_SIZE):
         offsets = i + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
         x = tl.load(x_row_ptr + offsets, mask=mask, other=0.0)
-        
-        q_f = x / scale
-        q_f = tl.clamp(q_f, -128.0, 127.0)
+        q_f = tl.clamp(x / scale, -128.0, 127.0)
         q_i = libdevice.rint(q_f).to(tl.int32)
-        
         tl.store(y_row_ptr + offsets, q_i.to(tl.int8), mask=mask)
-    
+
     tl.store(s_ptr + row_idx, scale.to(tl.float32))
 
 
@@ -561,37 +561,34 @@ def _int8_matmul_dequant_kernel(
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
-    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
-    
+
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
-    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
-    
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+
     for k in range(0, tl.cdiv(K, BLOCK_K)):
-        k_mask_a = offs_k[None, :] < K - k * BLOCK_K
-        k_mask_b = offs_k[:, None] < K - k * BLOCK_K
-        a = tl.load(a_ptrs, mask=k_mask_a, other=0)
-        b = tl.load(b_ptrs, mask=k_mask_b, other=0)
-        
-        accumulator += tl.dot(a, b)
-        
+        k_offs = k * BLOCK_K + offs_k
+        a_mask = (offs_am[:, None] < M) & (k_offs[None, :] < K)
+        b_mask = (k_offs[:, None] < K) & (offs_bn[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0)
+        acc += tl.dot(a, b)
+
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
 
-    # Fused Epilogue (Dequantize & Bias)
     scale_a = tl.load(a_scale_ptr + offs_am, mask=offs_am < M, other=1.0)
-    
     if HAS_PER_CHANNEL_SCALE:
         scale_b = tl.load(b_scale_ptr + offs_bn, mask=offs_bn < N, other=1.0)
     else:
         scale_b = tl.load(b_scale_ptr)
 
-    c = accumulator.to(tl.float32)
-    total_scale = scale_a[:, None] * scale_b[None, :]
-    c = c * total_scale
+    c = acc.to(tl.float32) * (scale_a[:, None] * scale_b[None, :])
 
     if HAS_BIAS:
         bias = tl.load(bias_ptr + offs_bn, mask=offs_bn < N, other=0.0)
@@ -599,7 +596,6 @@ def _int8_matmul_dequant_kernel(
 
     c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]
     c_mask = (offs_am[:, None] < M) & (offs_bn[None, :] < N)
-    
     tl.store(c_ptrs, c, mask=c_mask)
 
 
@@ -922,19 +918,20 @@ def triton_hadamard_quip_linear(
     if M > _HADAMARD_CHUNK_SIZE and _HADAMARD_CHUNK_SIZE > 0:
         if _HADAMARD_DIAGNOSTICS:
             print(f"[DIAG CHUNK] Processing batch: {M} rows in chunks of {_HADAMARD_CHUNK_SIZE}")
-        
+
         output_chunks = []
-        
+
         for start_idx in range(0, M, _HADAMARD_CHUNK_SIZE):
             end_idx = min(start_idx + _HADAMARD_CHUNK_SIZE, M)
             chunk = x_2d[start_idx:end_idx]
-            
+
             output_chunk = triton_hadamard_quip_linear(
                 chunk, weight, weight_scale, None, compute_dtype,
                 hadamard_size_in=hadamard_size_in,
                 hadamard_size_out=hadamard_size_out,
                 sign_row=sign_row,
                 sign_col=sign_col,
+                out_features=original_N,   # <-- critical: propagate out_features
                 use_fp32_output=use_fp32_output
             )
             
