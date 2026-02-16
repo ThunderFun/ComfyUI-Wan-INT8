@@ -28,7 +28,7 @@ class WanVideoINT8Loader:
         return {
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
-                "model_type": (["wan2.2", "wan2.1", "flux2", "z-image"],),
+                "model_type": (["wan2.2", "wan2.1", "flux2", "z-image", "chroma", "ltx2", "qwen", "anima"],),
                 "offload_to_cpu": (["enable", "disable"], {"default": "disable"}),
                 "auto_convert_to_int8": (["enable", "disable"], {"default": "enable"}),
                 "debug_mode": ("BOOLEAN", {"default": False}),
@@ -100,6 +100,25 @@ class WanVideoINT8Loader:
                 'patch_embed', 'text_projection', 'time_projection', 'head',
                 'modulation', 'guidance', 'img_emb', 'txt_emb', 'time_emb',
                 'final_layer', 'output_projection'
+            ]
+        elif model_type == "chroma":
+            Int8TensorwiseOps.excluded_names = [
+                'distilled_guidance_layer', 'final_layer', 'img_in', 'txt_in', 'nerf_image_embedder',
+                'nerf_blocks', 'nerf_final_layer_conv', '__x0__',
+            ]
+        elif model_type == "qwen":
+            Int8TensorwiseOps.excluded_names = [
+                'time_text_embed', 'img_in', 'norm_out', 'proj_out', 'txt_in'
+            ]
+        elif model_type == "ltx2":
+            Int8TensorwiseOps.excluded_names = [
+                'adaln_single', 'audio_adaln_single', 'audio_caption_projection', 'audio_patchify_proj', 'audio_proj_out',
+                'audio_scale_shift_table', 'av_ca_a2v_gate_adaln_single', 'av_ca_audio_scale_shift_adaln_single', 'av_ca_v2a_gate_adaln_single',
+                'av_ca_video_scale_shift_adaln_single', 'caption_projection', 'patchify_proj', 'proj_out', 'scale_shift_table',
+            ]
+        elif model_type == "anima":
+            Int8TensorwiseOps.excluded_names = [
+                "t_embedder", "x_embedder", "final_layer", "llm_adapter", "adaln_modulation",
             ]
 
         import time
