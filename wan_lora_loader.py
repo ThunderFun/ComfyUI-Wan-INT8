@@ -663,6 +663,21 @@ class WanLoRALoader:
 
             new_model = model.clone()
             
+            # Clear existing LoRA patches from INT8 modules.
+            # model.clone() shares the underlying model.model, so we need to
+            # ensure no patches from previous runs persist on shared modules.
+            torch_model_for_cleanup = new_model.model
+            if hasattr(torch_model_for_cleanup, 'named_modules'):
+                cleared_count = 0
+                for name, mod in torch_model_for_cleanup.named_modules():
+                    if hasattr(mod, 'lora_patches') and hasattr(mod, '_is_quantized'):
+                        if mod.lora_patches:
+                            mod.lora_patches = []
+                            cleared_count += 1
+                if cleared_count > 0:
+                    print(f"[LoRA] Cleared {cleared_count} existing patches from INT8 modules")
+            del torch_model_for_cleanup
+            
             with _object_patches_lock:
                 if not hasattr(new_model, "object_patches"):
                     new_model.object_patches = {}
@@ -871,6 +886,9 @@ class WanLoRALoader:
 
             with _object_patches_lock:
                 for target_key, int8_module, patch_list in int8_direct_patches:
+                    # Clear existing patches before setting new ones to prevent accumulation.
+                    if int8_module.lora_patches:
+                        int8_module.lora_patches = []
                     int8_module.lora_patches = patch_list
                     patched_count += 1
                     if target_key not in new_model.object_patches:
